@@ -1,0 +1,23 @@
+{
+  "name": "chatspace-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/main.ts",
+  "dependencies": {
+    "baileys": "^7.0.0-rc14",
+    "pino": "^10.4.0",
+    "qrcode": "^1.5.4",
+    "telegram": "^2.26.22",
+    "zca-js": "^2.2.0"
+  },
+  "devDependencies": {
+    "@types/qrcode": "^1.5.6",
+    "bun-types": "^1.4.4",
+    "typescript": "^7.0.2"
+  },
+  "scripts": {
+    "typecheck": "tsc -p .",
+    "build": "bun build src/main.ts --compile --compile-exec-argv=--smol --outfile dist/chatspace-bridge"
+  }
+}

@@ -1,0 +1,138 @@
+// Reconstructed from Zalo PC 26.10.20 generated jspb code
+//   pc-dist/shared-worker.*.js  module "1y5R"  -> Sync2.Message
+//   pc-dist/shared-worker.*.js  module "Ho1Y"  -> Sync2.Conversation
+//   pc-dist/shared-worker.*.js  module "N3ek"  -> Sync2.Shared
+// Field numbers and scalar kinds are read directly from deserializeBinaryFromReader /
+// serializeBinaryToWriter. Package/message nesting is exact (proto.Sync2.Message.*).
+// Field *names* are the jspb accessor names converted to snake_case; JSON/wire is unaffected.
+// jspb quirk: fields read with readUint64()/readInt64() surface as JS numbers (lossy > 2^53),
+// fields read with read{Uint,Int}64String() surface as decimal strings (marked below).
+
+syntax = "proto3";
+
+// ---- Sync2.Shared (module N3ek) --------------------------------------------
+package Sync2.Shared;
+
+enum PlatformType {
+  PLATFORM_TYPE_UNSPECIFIED = 0;
+  PLATFORM_TYPE_MOBILE = 1;
+  PLATFORM_TYPE_WEB = 2;
+  PLATFORM_TYPE_PC = 3;
+  PLATFORM_TYPE_SYSTEM = 4;
+}
+
+// ---- Sync2.Message (module 1y5R) -------------------------------------------
+// (separate file in reality; shown together for brevity)
+package Sync2.Message;
+
+enum MessageStatus {
+  MESSAGE_STATUS_UNSPECIFIED = 0;
+  MESSAGE_STATUS_FAIL = 1;
+  MESSAGE_STATUS_SENDING = 2;
+  MESSAGE_STATUS_SENT = 3;
+  MESSAGE_STATUS_RECEIVED = 4;
+  MESSAGE_STATUS_SEEN = 5;
+}
+
+message SyncChunk {
+  Sync2.Shared.PlatformType platform = 1;   // enum; app serializer writes PLATFORM_TYPE_PC (3)
+  repeated Partition partitions = 2;
+}
+
+message Partition {
+  string id = 1;                            // "oneone/<globalId>" or "group/<globalId>" (see SPEC 7.2)
+  repeated Message messages = 2;
+}
+
+message Message {
+  string sender_id = 1;
+  uint64 client_id = 2;                     // cliMsgId (jspb: JS number)
+  MessageStatus msg_status = 3;
+  int32 msg_type = 4;                       // cliMsgType
+  uint64 timestamp = 5;                     // ms since epoch (jspb: JS number)
+  int64 global_id = 6;                      // msgId; readInt64String -> decimal string
+  string content = 7;
+  MetaData meta = 8;
+}
+
+message MetaData {
+  repeated Attach attachs = 1;
+  repeated Mention mentions = 2;
+  Reference reference = 3;
+  Quote quote = 4;
+  Properties property = 5;
+  uint64 ttl = 6;
+}
+
+message Mention {
+  string uid = 1;
+  int32 pos = 2;
+  int32 len = 3;
+  int32 type = 4;
+}
+
+message Quote {
+  string attach = 1;
+  string owner_id = 2;
+  int64 ts = 3;
+  string from_d = 4;
+  uint64 cli_msg_id = 5;
+  uint64 global_msg_id = 6;                 // readUint64String -> decimal string
+  string msg = 7;
+  int32 cli_msg_type = 8;
+  uint64 ttl = 9;
+  string partial_quote = 10;
+}
+
+message Attach {
+  string type = 1;
+  string ext_info = 2;
+  string action = 3;
+  string params = 4;
+  string title = 5;
+  string href = 6;
+  string thumb = 7;
+  string description = 8;
+  int32 cat_id = 9;
+  int32 id = 10;
+  int32 child_number = 11;
+  string remains = 12;
+  string zinstant_data = 13;
+  string zinstant_msg = 14;
+}
+
+message Properties {
+  int32 size = 1;
+  int32 color = 2;
+  int32 type = 3;
+  int32 sub_type = 4;
+  string ext = 5;
+}
+
+message Reference {
+  int32 type = 1;
+  string data = 2;
+}
+
+// ---- Sync2.Conversation (module Ho1Y) --------------------------------------
+package Sync2.Conversation;
+
+enum ConvType {
+  CONV_TYPE_UNSPECIFIED = 0;
+  CONV_TYPE_ONEONE = 1;
+  CONV_TYPE_GROUP = 2;
+}
+
+message SyncChunk {
+  Sync2.Shared.PlatformType platform = 1;
+  repeated Conversation conversations = 2;
+}
+
+message Conversation {
+  string conv_id = 1;                       // "global noised id" of the peer/group (SPEC 7.2)
+  ConvType conv_type = 2;
+  bool responded_by_me = 3;
+  uint64 last_ts = 4;
+  uint64 last_global_id = 5;                // readUint64String -> decimal string
+  uint64 last_client_id = 6;
+}
