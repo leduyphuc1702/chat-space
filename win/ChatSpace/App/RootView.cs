@@ -88,6 +88,12 @@ public sealed class PlatformRail : Reactive
         return VStack(0,
             Clear.Frame(height: 30), // traffic lights
             ScrollView(VStack(14, items.ToArray()).Frame(width: RailWidth).PaddingV(4), indicators: false).FillHeight(),
+            Updater.Shared.ReadyVersion is { } v
+                ? Button(Updater.Shared.RestartToUpdate,
+                        Image("arrow.down.circle.fill").Font(22).Foreground(SColor.Hex(0x34C759)).Frame(44, 36))
+                    .Help($"Đã tải ChatSpace {v} — bấm để khởi động lại và cập nhật (hoặc tự cập nhật khi thoát app)")
+                    .PaddingTop(8)
+                : null,
             Button(SettingsWindow.ShowShared,
                     Image("gearshape").Font(17).Foreground(SColor.White.Opacity(0.7)).Frame(44, 36))
                 .Help("Cài đặt")

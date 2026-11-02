@@ -6,6 +6,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CONFIG="${CONFIG:-release}"
 APP="$ROOT/dist/ChatSpace.app"
 BUN="${BUN:-$(command -v bun || echo "$HOME/.bun/bin/bun")}"
+VERSION="$(tr -d '[:space:]' < "$ROOT/VERSION")"
 
 echo "==> Swift app ($CONFIG)"
 (cd "$ROOT/app" && swift build -c "$CONFIG")
@@ -27,7 +28,7 @@ cp "$ROOT/bridges/messenger/chatspace-messenger" "$APP/Contents/Resources/bridge
 [ -f "$ROOT/app/Resources/AppIcon.icns" ] || swift "$ROOT/scripts/make-icon.swift" "$ROOT/app/Resources/AppIcon.icns"
 cp "$ROOT/app/Resources/AppIcon.icns" "$APP/Contents/Resources/"
 
-cat > "$APP/Contents/Info.plist" <<'PLIST'
+cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -38,8 +39,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleExecutable</key><string>ChatSpace</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.1.0</string>
-  <key>CFBundleVersion</key><string>1</string>
+  <key>CFBundleShortVersionString</key><string>$VERSION</string>
+  <key>CFBundleVersion</key><string>$VERSION</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSMicrophoneUsageDescription</key><string>ChatSpace ghi âm tin nhắn thoại khi bạn bấm nút micro.</string>

@@ -114,15 +114,16 @@ struct SettingsView: View {
         case .composer: ComposerSettingsPane()
         case .telegram: TelegramAPISettings()
         case .assets: AssetsSettings()
+        case .updates: UpdateSettings()
         }
     }
 }
 
 enum SettingsSection: String, CaseIterable, Identifiable {
-    case accounts, notifications, storage, groups, ignored, bubbles, translation, composer, telegram, assets
+    case accounts, notifications, storage, groups, ignored, bubbles, translation, composer, telegram, assets, updates
     var id: String { rawValue }
 
-    static let sidebarGroups: [[SettingsSection]] = [[.notifications, .storage], [.groups, .ignored, .bubbles, .translation, .composer], [.telegram, .assets]]
+    static let sidebarGroups: [[SettingsSection]] = [[.notifications, .storage], [.groups, .ignored, .bubbles, .translation, .composer], [.telegram, .assets, .updates]]
 
     var title: String {
         switch self {
@@ -136,6 +137,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .composer: "Soạn tin nhắn"
         case .telegram: "Telegram API"
         case .assets: "Tài nguyên gốc"
+        case .updates: "Cập nhật"
         }
     }
 
@@ -151,6 +153,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .composer: "function"
         case .telegram: "paperplane.fill"
         case .assets: "square.stack.3d.up.fill"
+        case .updates: "arrow.down.circle.fill"
         }
     }
 
@@ -166,6 +169,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .composer: Color(hex: 0xAF52DE)
         case .telegram: Color(hex: 0x2AABEE)
         case .assets: Color(hex: 0x8E8E93)
+        case .updates: Color(hex: 0x34C759)
         }
     }
 }
@@ -676,6 +680,38 @@ struct AssetsSettings: View {
                 .padding(.horizontal, 14).frame(minHeight: 46)
                 .overlay(alignment: .top) { if i > 0 { Rectangle().fill(TGS.separator).frame(height: 1).padding(.leading, 52) } }
             }
+        }
+    }
+}
+
+struct UpdateSettings: View {
+    var body: some View {
+        @Bindable var u = Updater.shared
+        TGSection(header: "Phiên bản", footer: u.supported ? "Bản mới được tải ngầm từ GitHub (\(Updater.repo)) và cài khi bạn bấm Khởi động lại hoặc khi thoát ChatSpace." : "Bản build này (dev / demo / chạy ngoài .app) không tự cập nhật.") {
+            TGRow(title: "ChatSpace \(u.currentVersion)", subtitle: status(u), first: true) {
+                switch u.state {
+                case .ready:
+                    Button("Khởi động lại để cập nhật") { u.restartToUpdate() }.buttonStyle(.borderedProminent).controlSize(.small)
+                case .checking, .downloading:
+                    ProgressView().controlSize(.small)
+                default:
+                    Button("Kiểm tra ngay") { Task { await u.check() } }.buttonStyle(.link).disabled(!u.supported)
+                }
+            }
+            TGRow(title: "Tự động kiểm tra và tải bản mới") {
+                Toggle("", isOn: $u.automatic).toggleStyle(.switch).labelsHidden().controlSize(.small)
+            }
+        }
+    }
+
+    private func status(_ u: Updater) -> String {
+        switch u.state {
+        case .idle: "Chưa kiểm tra"
+        case .checking: "Đang kiểm tra…"
+        case .upToDate: "Đang dùng bản mới nhất" + (u.lastCheck.map { " · kiểm tra lúc \($0.formatted(date: .omitted, time: .shortened))" } ?? "")
+        case .downloading(let v): "Đang tải bản \(v)…"
+        case .ready(let v): "Đã tải bản \(v), sẵn sàng cài đặt"
+        case .failed(let e): "Lỗi: \(e)"
         }
     }
 }

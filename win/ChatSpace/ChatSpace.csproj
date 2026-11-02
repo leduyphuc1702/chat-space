@@ -13,7 +13,7 @@
     <ApplicationIcon>Assets/AppIcon.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
-    <Version>0.1.0</Version>
+    <Version>$([System.IO.File]::ReadAllText('$(MSBuildThisFileDirectory)../../VERSION').Trim())</Version>
     <Product>ChatSpace</Product>
     <NoWarn>$(NoWarn);CS1998;CA1416</NoWarn>
   </PropertyGroup>

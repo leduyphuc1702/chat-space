@@ -36,7 +36,11 @@ public sealed class App : Application
             Start();
             desktop.MainWindow = MainWindow;
             desktop.ShutdownRequested += (_, _) => AppModel.Shared.StopAll();
-            desktop.Exit += (_, _) => AppModel.Shared.StopAll();
+            desktop.Exit += (_, _) =>
+            {
+                AppModel.Shared.StopAll();
+                Updater.Shared.InstallOnQuit();
+            };
             SetupTray();
         }
         base.OnFrameworkInitializationCompleted();

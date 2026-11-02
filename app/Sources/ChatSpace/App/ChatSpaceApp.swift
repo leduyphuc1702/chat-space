@@ -157,6 +157,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             NativeAssets.shared.registerZaloFonts()
             Notifier.shared.requestAuthorization()
             AppModel.shared.startAll()
+            Updater.shared.start()
             if DemoData.enabled { Self.runDemoScript() }
         }
     }
@@ -214,7 +215,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        MainActor.assumeIsolated { AppModel.shared.stopAll() }
+        MainActor.assumeIsolated {
+            AppModel.shared.stopAll()
+            Updater.shared.installOnQuit()
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }

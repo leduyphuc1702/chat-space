@@ -87,6 +87,16 @@ struct PlatformRail: View {
                 .padding(.vertical, 4)
             }
             .scrollIndicators(.never)
+            if let v = Updater.shared.readyVersion {
+                Button { Updater.shared.restartToUpdate() } label: {
+                    Image(systemName: "arrow.down.circle.fill").font(.system(size: 22)).foregroundStyle(Color(hex: 0x34C759))
+                        .frame(width: 44, height: 36).contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .focusEffectDisabled()
+                .help("Đã tải ChatSpace \(v) — bấm để khởi động lại và cập nhật (hoặc tự cập nhật khi thoát app)")
+                .padding(.top, 8)
+            }
             SettingsLink {
                 Image(systemName: "gearshape").font(.system(size: 17)).foregroundStyle(.white.opacity(0.7))
                     .frame(width: 44, height: 36).contentShape(Rectangle())

@@ -14,6 +14,7 @@ public static class AppStartup
 
     public static void AfterWindow()
     {
+        Updater.Shared.Start();
         if (DemoData.Enabled) RunDemoScript();
     }
 

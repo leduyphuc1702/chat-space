@@ -15,7 +15,7 @@ namespace ChatSpace;
 // Port of App/SettingsView.swift: Settings laid out like Telegram for macOS — a list of coloured-icon rows on
 // the left, grouped cards on a grey background on the right.
 
-public enum SettingsSection { Accounts, Notifications, Storage, Groups, Ignored, Bubbles, Translation, Composer, Telegram, Assets }
+public enum SettingsSection { Accounts, Notifications, Storage, Groups, Ignored, Bubbles, Translation, Composer, Telegram, Assets, Updates }
 
 public static class SettingsSections
 {
@@ -23,7 +23,7 @@ public static class SettingsSections
     [
         [SettingsSection.Notifications, SettingsSection.Storage],
         [SettingsSection.Groups, SettingsSection.Ignored, SettingsSection.Bubbles, SettingsSection.Translation, SettingsSection.Composer],
-        [SettingsSection.Telegram, SettingsSection.Assets],
+        [SettingsSection.Telegram, SettingsSection.Assets, SettingsSection.Updates],
     ];
 
     /// `rawValue` of the Swift enum (the case name), which is what `settings.section` stores.
@@ -43,6 +43,7 @@ public static class SettingsSections
         SettingsSection.Translation => "Dịch tin nhắn",
         SettingsSection.Composer => "Soạn tin nhắn",
         SettingsSection.Telegram => "Telegram API",
+        SettingsSection.Updates => "Cập nhật",
         _ => "Tài nguyên gốc",
     };
 
@@ -57,6 +58,7 @@ public static class SettingsSections
         SettingsSection.Translation => "translate",
         SettingsSection.Composer => "function",
         SettingsSection.Telegram => "paperplane.fill",
+        SettingsSection.Updates => "arrow.down.circle.fill",
         _ => "square.stack.3d.up.fill",
     };
 
@@ -71,6 +73,7 @@ public static class SettingsSections
         SettingsSection.Translation => SColor.Hex(0x30B0C7),
         SettingsSection.Composer => SColor.Hex(0xAF52DE),
         SettingsSection.Telegram => SColor.Hex(0x2AABEE),
+        SettingsSection.Updates => SColor.Hex(0x34C759),
         _ => SColor.Hex(0x8E8E93),
     };
 }
@@ -544,6 +547,7 @@ public sealed class SettingsRoot : Decorator, IFlexible
         SettingsSection.Translation => TranslationSettingsPane.Make(),
         SettingsSection.Composer => ComposerSettingsPane.Make(),
         SettingsSection.Telegram => new TelegramAPISettings(),
+        SettingsSection.Updates => UpdateSettings.Make(),
         _ => AssetsSettings.Make(),
     };
 }
@@ -1226,4 +1230,33 @@ internal static class AssetsSettings
         if (NativeAssets.Shared.AppLaunch(p) is not { } launch) return null;
         return Path.IsPathRooted(launch) ? Path.GetFileName(launch.TrimEnd('/', '\\')) : p.DisplayName();
     }
+}
+
+internal static class UpdateSettings
+{
+    public static Control Make() => View(() =>
+    {
+        var u = Updater.Shared;
+        Control trailing = u.State switch
+        {
+            Updater.UpdateState.Ready => new MacButton(Text("Khởi động lại để cập nhật"), u.RestartToUpdate, ButtonKind.Prominent, ControlSize.Small),
+            Updater.UpdateState.Checking or Updater.UpdateState.Downloading => new ProgressView(),
+            _ => SettingsKit.LinkButton("Kiểm tra ngay", () => _ = u.Check(), enabled: u.Supported),
+        };
+        var status = u.State switch
+        {
+            Updater.UpdateState.Checking => "Đang kiểm tra…",
+            Updater.UpdateState.UpToDate => "Đang dùng bản mới nhất" + (u.LastCheck is { } t ? $" · kiểm tra lúc {t:HH:mm}" : ""),
+            Updater.UpdateState.Downloading d => $"Đang tải bản {d.Version}…",
+            Updater.UpdateState.Ready r => $"Đã tải bản {r.Version}, sẵn sàng cài đặt",
+            Updater.UpdateState.Failed f => $"Lỗi: {f.Message}",
+            _ => "Chưa kiểm tra",
+        };
+        return SettingsKit.TGSection("Phiên bản",
+            u.Supported
+                ? $"Bản mới được tải ngầm từ GitHub ({Updater.Repo}) và cài khi bạn bấm Khởi động lại hoặc khi thoát ChatSpace."
+                : "Bản build này (dev / demo / chạy ngoài file .exe) không tự cập nhật.",
+            SettingsKit.TGRow($"ChatSpace {u.CurrentVersion}", trailing, subtitle: status, first: true),
+            SettingsKit.TGRow("Tự động kiểm tra và tải bản mới", SettingsKit.Switch(() => u.Automatic, v => u.Automatic = v)));
+    });
 }
