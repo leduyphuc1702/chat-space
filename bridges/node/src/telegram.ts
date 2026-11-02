@@ -26,6 +26,7 @@ import { Logger, LogLevel } from "telegram/extensions/Logger";
 import { UpdateConnectionState } from "telegram/network";
 import { StringSession } from "telegram/sessions";
 import { Adapter, type AdapterContext } from "./adapter.ts";
+import { Matcher, newestFirst, type SearchParams } from "./search.ts";
 import { sanitizeMentions, TtlCache } from "./mentions.ts";
 import {
   BridgeError,
@@ -209,6 +210,31 @@ function parseMsgId(v: string): number {
 }
 
 /** Map that evicts its oldest entry once `max` is exceeded. */
+/** Telegram's server-side filter for the requested kinds; anything it cannot express is filtered after the fact. */
+function searchFilter(kinds?: string[]): Api.TypeMessagesFilter {
+  const k = new Set(kinds ?? []);
+  if (k.size === 2 && k.has("image") && k.has("video")) return new Api.InputMessagesFilterPhotoVideo();
+  if (k.size !== 1) return new Api.InputMessagesFilterEmpty();
+  switch ([...k][0]) {
+    case "image":
+      return new Api.InputMessagesFilterPhotos();
+    case "video":
+      return new Api.InputMessagesFilterVideo();
+    case "file":
+      return new Api.InputMessagesFilterDocument();
+    case "link":
+      return new Api.InputMessagesFilterUrl();
+    case "voice":
+      return new Api.InputMessagesFilterVoice();
+    case "audio":
+      return new Api.InputMessagesFilterMusic();
+    case "gif":
+      return new Api.InputMessagesFilterGif();
+    default:
+      return new Api.InputMessagesFilterEmpty();
+  }
+}
+
 class BoundedMap<K, V> extends Map<K, V> {
   constructor(private readonly max: number) {
     super();
@@ -390,7 +416,7 @@ type RawUpdate = { _entities?: Map<string, Entity> };
 export class TelegramAdapter extends Adapter {
   readonly platform = "telegram";
   // "edit" is deliberately absent: the protocol has no edit method yet.
-  readonly capabilities = ["reactions", "reply", "delete", "edit", "typing", "read_receipts", "media_send", "voice", "folders", "mentions", "forward"];
+  readonly capabilities = ["reactions", "reply", "delete", "edit", "typing", "read_receipts", "media_send", "voice", "folders", "mentions", "forward", "search"];
 
   private creds?: Creds;
   private client?: TelegramClient;
@@ -1533,6 +1559,63 @@ export class TelegramAdapter extends Adapter {
       await this.fillReplies(chatId, kept, out);
       for (const m of out) this.rememberMessage(m);
       return out;
+    });
+  }
+
+  /**
+   * messages.search: Telegram's own server search (one chat, or every chat with SearchGlobal), plus the messages this
+   * bridge has seen recently, matched accent-insensitively so "hop dong" also finds "hợp đồng" there.
+   */
+  async searchMessages(p: SearchParams): Promise<Message[]> {
+    const client = this.requireClient();
+    return this.guard(async () => {
+      const filter = searchFilter(p.kinds);
+      const maxDate = p.before ? Math.floor(p.before / 1000) : 0;
+      const r = p.chatId
+        ? await client.invoke(
+            new Api.messages.Search({
+              peer: await this.inputPeer(p.chatId),
+              q: p.query,
+              filter,
+              minDate: 0,
+              maxDate,
+              offsetId: 0,
+              addOffset: 0,
+              limit: p.limit,
+              maxId: 0,
+              minId: 0,
+              hash: helpers.returnBigInt(0),
+            }),
+          )
+        : await client.invoke(
+            new Api.messages.SearchGlobal({
+              q: p.query,
+              filter,
+              minDate: 0,
+              maxDate,
+              offsetRate: 0,
+              offsetPeer: new Api.InputPeerEmpty(),
+              offsetId: 0,
+              limit: p.limit,
+            }),
+          );
+      const out: Message[] = [];
+      if (!(r instanceof Api.messages.MessagesNotModified)) {
+        for (const e of [...r.users, ...r.chats]) this.rememberEntity(e as Entity);
+        // The server already matched the words its own way; only the kind and page bounds are checked here.
+        const bounds = new Matcher({ ...p, query: "" });
+        for (const raw of r.messages) {
+          const m = await this.toProtocol(raw as RawMessage);
+          if (!m || (p.kinds && !bounds.test(m))) continue;
+          this.rememberMessage(m);
+          out.push(m);
+        }
+      }
+      const local = new Matcher(p);
+      for (const m of this.recent.values()) {
+        if ((!p.chatId || m.chatId === p.chatId) && local.test(m)) out.push(m);
+      }
+      return newestFirst(out, p.limit);
     });
   }
 

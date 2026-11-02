@@ -1,5 +1,6 @@
 import type { AuthState, Chat, EventName, Folder, Member, MentionSpan, Message, SelfInfo, StorageConfig } from "./types.ts";
 import { BridgeError } from "./types.ts";
+import type { SearchParams } from "./search.ts";
 
 export type Emit = (event: EventName, data: unknown) => void;
 
@@ -44,6 +45,10 @@ export abstract class Adapter {
     /** Only with capability "mentions"; adapters must run it through sanitizeMentions() before use. */
     mentions?: MentionSpan[];
   }): Promise<Message>;
+  /** messages.search (capability "search"): newest first. */
+  async searchMessages(_p: SearchParams): Promise<Message[]> {
+    throw new BridgeError("unsupported", "search is not supported");
+  }
   /** Platform-native forward of one message (capability "forward"). */
   async forwardMessage(_fromChatId: string, _messageId: string, _toChatId: string): Promise<Message> {
     throw new BridgeError("unsupported", "forward is not supported");

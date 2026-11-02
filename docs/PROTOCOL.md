@@ -150,6 +150,7 @@ interface Message {
 | `chats.avatar` | `{ chatId }` | `{ avatar?: string }` (lazy avatar resolution) |
 | `chats.members` | `{ chatId }` | `{ members: { id: string, name: string, avatar?: string }[] }` (capability `mentions`, see [Mentions](#mentions)) |
 | `messages.list` | `{ chatId, limit?: number, before?: string /* messageId */ }` | `{ messages: Message[] }` (ascending by time) |
+| `messages.search` | `{ query?: string, chatId?: string, kinds?: string[], before?: number /* ms */, limit?: number }` | `{ messages: Message[] }` (newest first; capability `search`, see [Search](#search)) |
 | `messages.send` | `{ chatId, text?, replyTo?: string, filePath?: string, mentions?: { userId: string, offset: number, length: number }[] }` | `{ message: Message }` |
 | `messages.forward` | `{ fromChatId, messageId, toChatId }` | `{ message: Message }` (capability `forward`, see [Forwarding](#forwarding)) |
 | `messages.markRead` | `{ chatId }` | `{}` |
@@ -193,7 +194,7 @@ emits `auth.state {state:"logged_out", error:"qr_expired"}`; the app then calls 
 again automatically while the QR screen is visible.
 
 `capabilities` tells the UI which actions to show, e.g.
-`["reactions","reply","delete","edit","typing","read_receipts","media_send","voice","mentions"]`.
+`["reactions","reply","delete","edit","typing","read_receipts","media_send","voice","mentions","search"]`.
 
 ### Mentions
 
@@ -235,6 +236,21 @@ Capability `mentions` means the bridge implements `chats.members` and the `menti
   parsing, unlike messages without mentions, because explicit entities replace the parser).
 - Messenger end-to-end encrypted chats carry the mention as an `@<fbid>@msgr` token plus `MentionedJID`
   (as mautrix-meta does); the stored/returned message keeps the typed `@Name`.
+
+### Search
+
+Capability `search` means the bridge implements `messages.search`, which finds messages by text, caption
+or file name across all chats (or one chat with `chatId`).
+
+- Every word of `query` must appear, in any order; matching ignores case, Vietnamese accents and đ/d
+  (`hop dong` finds `Hợp đồng`). An empty `query` with `kinds` lists messages of those kinds.
+- `kinds` filters by `Message.kind`; `link` also matches text messages that contain a URL. Without
+  `kinds`, deleted, system and call messages are left out.
+- `limit` defaults to 50 (max 200). The next page passes `before` = the oldest returned `timestamp`.
+- Zalo, WhatsApp and Messenger search the bridge's local store only (what was synced to this
+  computer); Messenger never contacts Meta for a search. Telegram asks the server
+  (`messages.search` / `messages.searchGlobal`) and merges matches from recently received messages.
+- Text inside images is not searched by bridges; the app keeps its own OCR index for that.
 
 ### Forwarding
 

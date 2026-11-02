@@ -1,6 +1,7 @@
 import { mkdirSync } from "node:fs";
 import { createInterface } from "node:readline";
 import type { Adapter, AdapterContext } from "./adapter.ts";
+import { parseSearch } from "./search.ts";
 import { BridgeError, type EventName } from "./types.ts";
 
 const VERSION = "0.1.0";
@@ -92,6 +93,7 @@ const handlers: Record<string, (p: Params) => Promise<unknown>> = {
   "messages.list": async (p) => ({
     messages: await adapter.listMessages(need(p, "chatId"), p.limit ?? 50, p.before),
   }),
+  "messages.search": async (p) => ({ messages: await adapter.searchMessages(parseSearch(p)) }),
   "messages.send": async (p) => {
     need(p, "chatId");
     if (!p.text && !p.filePath) throw new BridgeError("invalid_params", "text or filePath required");

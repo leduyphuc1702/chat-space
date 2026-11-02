@@ -159,6 +159,9 @@ struct TelegramChatList: View {
                             .onTapGesture { session.select(chat.id) }
                             .chatContextMenu(platform: session.platform, chat: chat)
                     }
+                    if !query.isEmpty {
+                        ChatListMessageResults(session: session, query: query, title: "Messages", accent: TG.accent)
+                    }
                 }
             }
         }
@@ -168,7 +171,8 @@ struct TelegramChatList: View {
     private var filtered: [Chat] {
         // Like Telegram, search covers every chat regardless of the selected folder.
         guard !query.isEmpty else { return session.visibleChats }
-        return session.chats.filter { $0.title.localizedCaseInsensitiveContains(query) }
+        let words = SearchText.terms(query)
+        return session.chats.filter { SearchText.contains($0.title, all: words) }
     }
 }
 
@@ -343,6 +347,7 @@ struct TelegramConversation: View {
                             TelegramServicePill(text: TG.dayTitle(row.message.date)).padding(.vertical, 8)
                         }
                         TelegramMessageRow(session: session, chat: chat, row: row)
+                            .revealHighlight(session, chatId: chat.id, id: row.id)
                             .padding(.top, row.isFirstInGroup ? 6 : 2)
                     }
                 }
@@ -350,6 +355,7 @@ struct TelegramConversation: View {
             TelegramComposer(session: session, chat: chat)
                     .mentionSuggestions(session: session, chat: chat, accent: TG.accent)
         }
+        .fileDropTarget(session: session, chatId: chat.id, accent: TG.accent)
     }
 
     private var header: some View {

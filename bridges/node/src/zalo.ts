@@ -27,6 +27,7 @@ import {
 } from "zca-js";
 import { Adapter, type AdapterContext } from "./adapter.ts";
 import * as mediaCache from "./media-cache.ts";
+import { searchLocal, type SearchParams } from "./search.ts";
 import { sanitizeMentions, TtlCache } from "./mentions.ts";
 import {
   BridgeError,
@@ -210,6 +211,7 @@ export class ZaloAdapter extends Adapter {
     "read_receipts",
     "media_send",
     "mentions",
+    "search",
     // the transfer is decrypted with Zalo's own library, read from the installed Zalo PC
     ...(existsSync(ZALO_ASAR) ? ["phone_sync"] : []),
   ];
@@ -2248,6 +2250,17 @@ export class ZaloAdapter extends Adapter {
       }
     }
     return list.slice(Math.max(0, end - limit), end).map((e) => this.outbound(e.m));
+  }
+
+  async searchMessages(p: SearchParams): Promise<Message[]> {
+    this.requireLogin();
+    const ids = p.chatId ? [p.chatId] : this.store.chatIds();
+    return searchLocal(
+      ids.map((id) => [id, this.store.list(id)] as [string, Entry[]]),
+      p,
+      (e) => this.outbound(e.m),
+      (e) => [e.m.text, e.m.deleted, e.m.media?.fileName],
+    );
   }
 
   private entryOrThrow(chatId: string, messageId: string): Entry {

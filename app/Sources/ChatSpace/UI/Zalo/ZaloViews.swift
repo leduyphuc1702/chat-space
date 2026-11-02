@@ -256,6 +256,9 @@ struct ZaloChatList: View {
                                 .onTapGesture { session.select(chat.id) }
                                 .chatContextMenu(platform: session.platform, chat: chat)
                         }
+                        if !query.isEmpty {
+                            ChatListMessageResults(session: session, query: query, accent: ZL.blue)
+                        }
                     }
                 }
             }
@@ -287,9 +290,10 @@ struct ZaloChatList: View {
 
     /// "Khác" holds chats with strangers/unknown names and muted chats, approximating Zalo's split.
     private var filtered: [Chat] {
-        session.chats.filter { c in
+        let words = SearchText.terms(query)
+        return session.chats.filter { c in
             let other = c.isMuted || c.lastMessage == nil
-            return (query.isEmpty || c.title.localizedCaseInsensitiveContains(query)) && (query.isEmpty ? (tab == 0 ? !other : other) : true)
+            return (words.isEmpty || SearchText.contains(c.title, all: words)) && (query.isEmpty ? (tab == 0 ? !other : other) : true)
         }
     }
 }
@@ -519,6 +523,7 @@ struct ZaloConversation: View {
                                 .frame(maxWidth: .infinity).padding(.vertical, 12)
                         }
                         ZaloMessageRow(session: session, chat: chat, row: row, showStatus: row.id == lastOut)
+                            .revealHighlight(session, chatId: chat.id, id: row.id)
                             .padding(.top, row.isFirstInGroup && !row.showTimeGap ? 10 : 3)
                     }
                 }
@@ -526,6 +531,7 @@ struct ZaloConversation: View {
             ZaloComposer(session: session, chat: chat)
                     .mentionSuggestions(session: session, chat: chat, accent: ZL.blue)
         }
+        .fileDropTarget(session: session, chatId: chat.id, accent: ZL.blue)
     }
 
     private var header: some View {

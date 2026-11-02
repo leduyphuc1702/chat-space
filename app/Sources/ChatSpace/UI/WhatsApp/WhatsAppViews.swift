@@ -260,6 +260,9 @@ struct WhatsAppChatList: View {
                             .onTapGesture { session.select(chat.id) }
                             .chatContextMenu(platform: session.platform, chat: chat)
                     }
+                    if !query.isEmpty {
+                        ChatListMessageResults(session: session, query: query, accent: WA.teal)
+                    }
                 }
             }
         }
@@ -267,8 +270,9 @@ struct WhatsAppChatList: View {
     }
 
     private var filtered: [Chat] {
-        session.chats.filter { c in
-            (query.isEmpty || c.title.localizedCaseInsensitiveContains(query)) &&
+        let words = SearchText.terms(query)
+        return session.chats.filter { c in
+            (words.isEmpty || SearchText.contains(c.title, all: words)) &&
             (filter != 1 || c.hasUnread) && (filter != 3 || c.isGroup) && (filter != 2 || c.isPinned)
         }
     }
@@ -362,6 +366,7 @@ struct WhatsAppConversation: View {
                             WhatsAppSystemChip(text: WA.dayTitle(row.message.date)).padding(.vertical, 8)
                         }
                         WhatsAppMessageRow(session: session, chat: chat, row: row)
+                            .revealHighlight(session, chatId: chat.id, id: row.id)
                             .padding(.top, row.isFirstInGroup ? 10 : 2)
                     }
                 }
@@ -369,6 +374,7 @@ struct WhatsAppConversation: View {
             WhatsAppComposer(session: session, chat: chat)
                     .mentionSuggestions(session: session, chat: chat, accent: WA.teal)
         }
+        .fileDropTarget(session: session, chatId: chat.id, accent: WA.teal)
     }
 
     private var header: some View {

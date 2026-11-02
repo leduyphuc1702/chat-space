@@ -48,6 +48,8 @@ final class PlatformSession {
     var mentionPicks: [String: [MentionPick]] = [:]
     var mathPreviews: [String: MathPreview] = [:]
     @ObservationIgnored private var loadingMembers: Set<String> = []
+    /// Platform id of each message first shown with a "pending-" id, once the send went through.
+    @ObservationIgnored private var sentIds: [String: String] = [:]
     /// Messenger's PIN-protected backup of end-to-end encrypted chats (history.status).
     var historyBackup: HistoryBackup = .unknown
     /// Encrypted Messenger chats whose pre-encryption history is loading / fully loaded (history.loadOpen).
@@ -89,8 +91,11 @@ final class PlatformSession {
     }
 
     /// Chats in the selected Telegram folder (all chats when none is selected).
-    var visibleChats: [Chat] {
-        guard let id = selectedFolderId, let f = folders.first(where: { $0.id == id }) else { return chats }
+    var visibleChats: [Chat] { chats(inFolder: selectedFolderId) }
+
+    /// Chats of one Telegram folder in Telegram's order (all chats for nil or an unknown folder).
+    func chats(inFolder id: String?) -> [Chat] {
+        guard let id, let f = folders.first(where: { $0.id == id }) else { return chats }
         let pinned = f.pinnedChatIds
         let list = chats.filter { f.contains($0) }
         guard !pinned.isEmpty else { return list }
@@ -113,6 +118,7 @@ final class PlatformSession {
         guard bridge == nil else { return }
         if DemoData.enabled {
             DemoData.load(into: self)
+            for list in messages.values { ImageTextIndexer.shared.consider(list, on: platform) }
             return
         }
         let b = BridgeProcess(platform: platform)
@@ -333,6 +339,7 @@ final class PlatformSession {
            let f = try? r["folders"]?.decode([ChatFolder].self) {
             applyFolders(f)
         }
+        ImageTextIndexer.shared.crawl(self)
     }
 
     func applyFolders(_ f: [ChatFolder]) {
@@ -409,26 +416,86 @@ final class PlatformSession {
             let list = try r["messages"]?.decode([Message].self) ?? []
             messages[chatId] = merge(messages[chatId] ?? [], list)
             if list.count < 50 { reachedStart.insert(chatId) }
+            ImageTextIndexer.shared.consider(list, on: platform)
         } catch {
             bridgeError = error.localizedDescription
         }
     }
 
     func loadOlder(_ chatId: String) {
+        Task { await fetchOlder(chatId) }
+    }
+
+    /// One page of older history; false when nothing more could be loaded.
+    @discardableResult
+    private func fetchOlder(_ chatId: String, limit: Int = 50) async -> Bool {
         guard !reachedStart.contains(chatId), !loadingHistory.contains(chatId),
-              let first = messages[chatId]?.first else { return }
+              let first = messages[chatId]?.first else { return false }
         loadingHistory.insert(chatId)
-        Task {
-            defer { loadingHistory.remove(chatId) }
-            do {
-                let r = try await call("messages.list", ["chatId": .string(chatId), "limit": 50, "before": .string(first.id)])
-                let list = try r["messages"]?.decode([Message].self) ?? []
-                if list.isEmpty { reachedStart.insert(chatId) }
-                messages[chatId] = merge(messages[chatId] ?? [], list)
-            } catch {
-                reachedStart.insert(chatId)
-            }
+        defer { loadingHistory.remove(chatId) }
+        do {
+            let r = try await call("messages.list", ["chatId": .string(chatId), "limit": .number(Double(limit)), "before": .string(first.id)])
+            let list = try r["messages"]?.decode([Message].self) ?? []
+            if list.isEmpty { reachedStart.insert(chatId) }
+            messages[chatId] = merge(messages[chatId] ?? [], list)
+            ImageTextIndexer.shared.consider(list, on: platform)
+            return !list.isEmpty
+        } catch {
+            reachedStart.insert(chatId)
+            return false
         }
+    }
+
+    // MARK: Search
+
+    /// Messages matching `query` (every word, accent-insensitive), newest first: the bridge searches all it has
+    /// (`messages.search`), otherwise only what is loaded here. `before` (ms) asks for the next page.
+    func search(_ query: String, chatId: String? = nil, kinds: [MessageKind]? = nil,
+                before: Double? = nil, limit: Int = 50) async throws -> [Message] {
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty || !(kinds ?? []).isEmpty else { return [] }
+        guard can("search"), bridge != nil else {
+            return SearchText.localSearch(messages, query: q, chatId: chatId, kinds: kinds, before: before, limit: limit)
+        }
+        var p: [String: JSONValue] = ["query": .string(q), "limit": .number(Double(limit))]
+        if let chatId { p["chatId"] = .string(chatId) }
+        if let kinds, !kinds.isEmpty { p["kinds"] = .array(kinds.map { .string($0.rawValue) }) }
+        if let before { p["before"] = .number(before) }
+        let r = try await call("messages.search", p)
+        return try r["messages"]?.decode([Message].self) ?? []
+    }
+
+    /// Message briefly highlighted after a search jumped to it, per chat.
+    var highlighted: [String: String] = [:]
+    /// Chat whose history is being paged back to reach a search result.
+    var revealing: String?
+
+    /// Opens the history of `m`'s chat far enough back to contain it, then scrolls there and highlights it.
+    /// Returns false when the message could not be reached (deleted, or too far back).
+    @discardableResult
+    func reveal(_ m: Message) async -> Bool {
+        let chatId = m.chatId
+        revealing = chatId
+        defer { if revealing == chatId { revealing = nil } }
+        if messages[chatId] == nil { await loadMessages(chatId) }
+        func loaded() -> Bool { messages[chatId]?.contains { $0.id == m.id } ?? false }
+        var pages = 0
+        while !loaded(), pages < 60 {
+            while loadingHistory.contains(chatId) { try? await Task.sleep(nanoseconds: 50_000_000) }
+            if let first = messages[chatId]?.first, first.timestamp < m.timestamp - 1 { break }
+            guard await fetchOlder(chatId, limit: 100) else { break }
+            pages += 1
+        }
+        guard loaded() else { return false }
+        scrollTarget[chatId] = nil
+        highlighted[chatId] = m.id
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        scrollTarget[chatId] = m.id
+        Task {
+            try? await Task.sleep(nanoseconds: 2_600_000_000)
+            if highlighted[chatId] == m.id { highlighted[chatId] = nil }
+        }
+        return true
     }
 
     /// Without an explicit file, the chat's staged attachments go out too, the text as the first one's caption.
@@ -521,6 +588,15 @@ final class PlatformSession {
         if let reply { optimistic.replyTo = ReplyRef(id: reply.id, text: reply.text, senderName: reply.senderName, kind: reply.kind) }
         upsert(optimistic)
 
+        var reply = reply
+        if let pending = reply {
+            do {
+                reply = try await settled(pending)
+            } catch {
+                if let i = messages[chatId]?.firstIndex(where: { $0.id == tempId }) { messages[chatId]?[i].status = .failed }
+                throw error
+            }
+        }
         var p: [String: JSONValue] = ["chatId": .string(chatId)]
         if !text.isEmpty { p["text"] = .string(text) }
         if let filePath { p["filePath"] = .string(filePath) }
@@ -530,6 +606,7 @@ final class PlatformSession {
             var sent = optimistic
             sent.id = "demo-\(UUID().uuidString)"
             sent.status = .sent
+            sentIds[tempId] = sent.id
             messages[chatId]?.removeAll { $0.id == tempId }
             upsert(sent)
             return sent
@@ -538,6 +615,7 @@ final class PlatformSession {
             let r = try await call("messages.send", p)
             let m = try r["message"]?.decode(Message.self)
             if let m {
+                sentIds[tempId] = m.id
                 messages[chatId]?.removeAll { $0.id == tempId }
                 upsert(m)
             }
@@ -549,6 +627,25 @@ final class PlatformSession {
             }
             throw error
         }
+    }
+
+    /// `m` under its platform id. A message still showing as pending (an image uploading) is waited for,
+    /// since replying to its local "pending-" id is refused by every bridge.
+    func settled(_ m: Message) async throws -> Message {
+        guard m.id.hasPrefix("pending-") else { return m }
+        for _ in 0..<240 {
+            if let id = sentIds[m.id] {
+                if let real = messages[m.chatId]?.first(where: { $0.id == id }) { return real }
+                var real = m
+                real.id = id
+                real.status = .sent
+                return real
+            }
+            let current = messages[m.chatId]?.first { $0.id == m.id }
+            if current == nil || current?.status == .failed { break }
+            try await Task.sleep(nanoseconds: 500_000_000)
+        }
+        throw BridgeError.remote(code: "pending", message: "Tin được trả lời chưa gửi xong, thử lại sau khi nó gửi xong")
     }
 
     /// The platform's own forward (capability `forward`): same message, "Forwarded" label, no re-upload.
@@ -1046,6 +1143,7 @@ final class PlatformSession {
             list.sort { $0.timestamp < $1.timestamp }
         }
         if messages[m.chatId] != nil || m.chatId == selectedChatId { messages[m.chatId] = list }
+        ImageTextIndexer.shared.consider([m], on: platform)
 
         if !isUpdate, let i = chats.firstIndex(where: { $0.id == m.chatId }) {
             if (chats[i].lastMessage?.timestamp ?? 0) <= m.timestamp {

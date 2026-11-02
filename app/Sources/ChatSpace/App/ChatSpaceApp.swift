@@ -24,6 +24,12 @@ struct ChatSpaceApp: App {
                         .keyboardShortcut(KeyEquivalent(Character("\(i + 1)")), modifiers: .command)
                 }
             }
+            CommandGroup(after: .textEditing) {
+                Button("Tìm kiếm trên mọi nền tảng…") { model.searchOpen.toggle() }
+                    .keyboardShortcut("k", modifiers: .command)
+                Button("Tìm tin nhắn") { model.searchOpen = true }
+                    .keyboardShortcut("f", modifiers: [.command, .shift])
+            }
         }
 
         Settings {
@@ -52,6 +58,8 @@ final class AppModel {
         didSet { markVisibleRead() }
     }
     let sessions: [Platform: PlatformSession]
+    /// The ⌘K search over every platform is shown.
+    var searchOpen = false
 
     private init() {
         let env = ProcessInfo.processInfo.environment["CHATSPACE_PLATFORM"]

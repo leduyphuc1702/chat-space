@@ -165,6 +165,9 @@ struct MessengerChatList: View {
                             .onTapGesture { session.select(chat.id) }
                             .chatContextMenu(platform: session.platform, chat: chat)
                     }
+                    if !query.isEmpty {
+                        ChatListMessageResults(session: session, query: query, accent: MS.blue)
+                    }
                 }
                 .padding(.horizontal, 8)
             }
@@ -173,7 +176,8 @@ struct MessengerChatList: View {
     }
 
     private var filtered: [Chat] {
-        session.chats.filter { query.isEmpty || $0.title.localizedCaseInsensitiveContains(query) }
+        let words = SearchText.terms(query)
+        return session.chats.filter { words.isEmpty || SearchText.contains($0.title, all: words) }
             .filter { tab == 0 ? $0.kind != .channel : $0.kind == .channel }
     }
 
@@ -369,6 +373,7 @@ struct MessengerConversation: View {
                             .frame(maxWidth: .infinity).padding(.vertical, 12)
                     }
                     MessengerMessageRow(session: session, chat: chat, row: row, showStatus: row.id == lastOut)
+                        .revealHighlight(session, chatId: chat.id, id: row.id)
                         .padding(.top, row.isFirstInGroup && !row.showTimeGap ? 8 : 1)
                     if row.id == chat.encryptedAfter { encryptionDivider }
                 }
@@ -378,6 +383,7 @@ struct MessengerConversation: View {
                     .mentionSuggestions(session: session, chat: chat, accent: MS.blue)
         }
         .background(Color.white)
+        .fileDropTarget(session: session, chatId: chat.id, accent: MS.blue)
     }
 
     private var header: some View {

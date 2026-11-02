@@ -21,6 +21,9 @@ struct RootView: View {
         }
         .ignoresSafeArea()
         .background(Color(nsColor: .windowBackgroundColor))
+        .overlay {
+            if model.searchOpen { GlobalSearchOverlay() }
+        }
     }
 
     @ViewBuilder
@@ -45,6 +48,17 @@ struct PlatformRail: View {
         let ws = Workspace.shared
         VStack(spacing: 0) {
             Color.clear.frame(height: 30) // traffic lights
+            Button { model.searchOpen.toggle() } label: {
+                Image(systemName: "magnifyingglass").font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(.white.opacity(model.searchOpen ? 1 : 0.75))
+                    .frame(width: 44, height: 32)
+                    .background(RoundedRectangle(cornerRadius: 9, style: .continuous).fill(.white.opacity(model.searchOpen ? 0.18 : 0.08)))
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .focusEffectDisabled()
+            .help("Tìm kiếm trên mọi nền tảng — tin nhắn, tệp, chữ trong ảnh (⌘K)")
+            .padding(.bottom, 10)
             ScrollView(.vertical, showsIndicators: false) {
                 VStack(spacing: 14) {
                     if ws.showInbox {

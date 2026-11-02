@@ -506,6 +506,11 @@ export class WAStore {
     return this.msgs.get(chatId) ?? [];
   }
 
+  /** Chats that have stored messages. */
+  messageChatIds(): string[] {
+    return [...this.msgs.keys()];
+  }
+
   getMsg(chatId: string, id: string): StoredMsg | undefined {
     return this.idx.get(chatId)?.get(id);
   }

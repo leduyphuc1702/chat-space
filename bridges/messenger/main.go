@@ -30,7 +30,7 @@ const (
 	requestTimeout = 3 * time.Minute
 )
 
-var capabilities = []string{"reactions", "reply", "delete", "edit", "typing", "read_receipts", "media_send", "password_login", "mentions", "open_history", "history_pin"}
+var capabilities = []string{"reactions", "reply", "delete", "edit", "typing", "read_receipts", "media_send", "password_login", "mentions", "open_history", "history_pin", "search"}
 
 // frameWriter serialises every frame written to stdout.
 type frameWriter struct {
@@ -273,6 +273,16 @@ func (s *server) routes() map[string]handler {
 				return nil, err
 			}
 			return map[string]any{"messages": msgs}, nil
+		},
+		"messages.search": func(ctx context.Context, p params) (any, error) {
+			if err := b.requireRead(); err != nil {
+				return nil, err
+			}
+			sp, err := parseSearch(p)
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{"messages": b.st.searchMessages(sp)}, nil
 		},
 		"messages.send": func(ctx context.Context, p params) (any, error) {
 			id, err := p.need("chatId")

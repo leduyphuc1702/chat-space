@@ -36,6 +36,7 @@ import { pipeline } from "node:stream/promises";
 import { basename, extname, join } from "node:path";
 import { Adapter, type AdapterContext } from "./adapter.ts";
 import * as mediaCache from "./media-cache.ts";
+import { searchLocal, type SearchParams } from "./search.ts";
 import { rewriteWhatsAppMentions, sanitizeMentions, TtlCache } from "./mentions.ts";
 import {
   BridgeError,
@@ -81,7 +82,7 @@ const safeName = (s: string) => s.replace(/[^A-Za-z0-9._-]/g, "_");
 export class WhatsAppAdapter extends Adapter {
   readonly platform = "whatsapp";
   // "edit" is deliberately absent: the protocol has no edit method yet (edits are received and shown).
-  readonly capabilities = ["reactions", "reply", "delete", "edit", "typing", "read_receipts", "media_send", "voice", "presence", "mentions", "forward"];
+  readonly capabilities = ["reactions", "reply", "delete", "edit", "typing", "read_receipts", "media_send", "voice", "presence", "mentions", "forward", "search"];
 
   private store: WAStore;
   private readonly authDir: string;
@@ -1288,6 +1289,17 @@ export class WhatsAppAdapter extends Adapter {
     }
     if (!before) this.subscribePresence(cid);
     return pg.messages;
+  }
+
+  async searchMessages(p: SearchParams): Promise<Message[]> {
+    this.requireData();
+    const ids = p.chatId ? [this.store.canon(p.chatId)] : this.store.messageChatIds();
+    return searchLocal(
+      ids.map((id) => [id, this.store.messages(id)] as [string, StoredMsg[]]),
+      { ...p, chatId: undefined },
+      (sm, cid) => mapMessage(sm, cid, this.mc) ?? undefined,
+      (sm) => [sm.raw, sm.deleted, sm.edited],
+    );
   }
 
   /**

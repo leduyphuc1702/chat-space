@@ -23,7 +23,11 @@ final class Forwarder {
     private(set) var running = false
     var note = ""
     var query = ""
-    var filter: Platform?
+    var filter: Platform? {
+        didSet { if filter != .telegram { telegramFolder = nil } }
+    }
+    /// Telegram folder the list is narrowed to, as in Telegram's own forward dialog.
+    var telegramFolder: String?
     /// Chat activity when the picker opened: the list keeps that order while the forwards themselves
     /// bump the picked chats to the top of their platforms.
     private(set) var recency: [ChatRef: Double] = [:]
@@ -60,6 +64,7 @@ final class Forwarder {
             note = ""
             query = ""
             filter = nil
+            telegramFolder = nil
             noteSent = []
             prepared = nil
             recency = [:]
@@ -305,6 +310,7 @@ struct ForwardView: View {
                 .padding(.horizontal, 10).frame(height: 30)
                 .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.06)))
                 platformFilter
+                if showsTelegramFolders { telegramFolders }
             }
             .padding(.horizontal, 12).padding(.bottom, 8)
             if !f.picked.isEmpty { pickedStrip }
@@ -346,8 +352,61 @@ struct ForwardView: View {
         .buttonStyle(.plain)
     }
 
+    private var telegram: PlatformSession { AppModel.shared.session(.telegram) }
+
+    /// Telegram's folder tabs, once Telegram is picked (or with every platform shown, picking a folder picks Telegram).
+    private var showsTelegramFolders: Bool {
+        (forwarder.filter == nil || forwarder.filter == .telegram) && loggedIn.contains(.telegram) && !telegram.folders.isEmpty
+    }
+
+    private var telegramFolders: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 2) {
+                folderTab(nil, title: forwarder.filter == .telegram ? "Tất cả chat" : "Thư mục Telegram")
+                ForEach(telegram.folders) { f in
+                    folderTab(f.id, title: [f.emoticon, f.title].compactMap { $0 }.joined(separator: " "))
+                }
+            }
+            .padding(.horizontal, 2)
+        }
+        .overlay(alignment: .bottom) { Rectangle().fill(Color.primary.opacity(0.08)).frame(height: 1) }
+    }
+
+    private func folderTab(_ id: String?, title: String) -> some View {
+        let on = forwarder.filter == .telegram && forwarder.telegramFolder == id
+        let badge = id.map { id in telegram.folderBadge(telegram.folders.first { $0.id == id }) }
+        return Button {
+            forwarder.filter = .telegram
+            forwarder.telegramFolder = id
+        } label: {
+            HStack(spacing: 4) {
+                if id == nil && forwarder.filter != .telegram { PlatformIcon(platform: .telegram, size: 12) }
+                Text(title).font(.system(size: 12, weight: on ? .semibold : .regular)).lineLimit(1)
+                if let b = badge, b.count > 0 {
+                    Text("\(b.count)").font(.system(size: 10, weight: .semibold)).foregroundStyle(.white)
+                        .padding(.horizontal, 4).frame(minWidth: 16, minHeight: 16)
+                        .background(Capsule().fill(b.muted ? Color.secondary.opacity(0.6) : Color(hex: 0x3390EC)))
+                }
+            }
+            .foregroundStyle(on ? Color(hex: 0x3390EC) : .secondary)
+            .padding(.horizontal, 8).frame(height: 28)
+            .overlay(alignment: .bottom) {
+                if on { Capsule().fill(Color(hex: 0x3390EC)).frame(height: 2.5).padding(.horizontal, 4) }
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(id == nil ? "Mọi đoạn chat Telegram" : "Chỉ các đoạn chat trong thư mục \(title)")
+    }
+
     private var candidates: [(ref: ChatRef, chat: Chat)] {
         let needle = CustomGroup.normalize(forwarder.query)
+        if forwarder.filter == .telegram, let folder = forwarder.telegramFolder {
+            // Telegram's own order inside a folder: its pins first, then recent activity.
+            return telegram.chats(inFolder: folder)
+                .filter { needle.isEmpty || CustomGroup.normalize($0.title).contains(needle) }
+                .map { (ref: ChatRef(platform: .telegram, chatId: $0.id), chat: $0) }
+        }
         let platforms = loggedIn.filter { forwarder.filter == nil || forwarder.filter == $0 }
         let all = platforms.flatMap { p in AppModel.shared.session(p).chats.map { (ref: ChatRef(platform: p, chatId: $0.id), chat: $0) } }
         return Array(all.filter { needle.isEmpty || CustomGroup.normalize($0.chat.title).contains(needle) }

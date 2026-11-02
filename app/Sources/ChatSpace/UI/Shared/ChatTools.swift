@@ -2,6 +2,7 @@ import AppKit
 import AVFoundation
 import Observation
 import SwiftUI
+import UniformTypeIdentifiers
 
 // MARK: Clickable toolbar icons
 
@@ -90,6 +91,97 @@ enum ChatTools {
         session.stage(files, in: chatId)
         NSApp.activate(ignoringOtherApps: true)
         Composer.focus()
+    }
+}
+
+// MARK: Dropping files onto a conversation
+
+extension View {
+    /// Files or images dragged anywhere over the conversation wait above the composer, as when
+    /// they are pasted or dropped on the composer itself.
+    func fileDropTarget(session: PlatformSession, chatId: String, accent: Color) -> some View {
+        modifier(FileDropTarget(session: session, chatId: chatId, accent: accent))
+    }
+}
+
+private struct FileDropTarget: ViewModifier {
+    let session: PlatformSession
+    let chatId: String
+    let accent: Color
+    @State private var targeted = false
+
+    func body(content: Content) -> some View {
+        content
+            .onDrop(of: [.fileURL, .image], isTargeted: $targeted) { providers in
+                DroppedFiles.load(providers) { ChatTools.sendPasted($0, session: session, chatId: chatId) }
+                return true
+            }
+            .overlay {
+                if targeted {
+                    ZStack {
+                        Rectangle().fill(.ultraThinMaterial)
+                        RoundedRectangle(cornerRadius: 16)
+                            .strokeBorder(accent, style: StrokeStyle(lineWidth: 2, dash: [8, 6]))
+                            .background(RoundedRectangle(cornerRadius: 16).fill(accent.opacity(0.06)))
+                            .padding(18)
+                        VStack(spacing: 10) {
+                            Image(systemName: "square.and.arrow.down.on.square").font(.system(size: 40, weight: .light))
+                                .foregroundStyle(accent)
+                            Text("Thả tệp vào đây để gửi").font(.system(size: 17, weight: .semibold))
+                            Text("Ảnh và tệp sẽ chờ phía trên ô soạn tin để bạn thêm chú thích")
+                                .font(.system(size: 12)).foregroundStyle(.secondary)
+                        }
+                    }
+                    .allowsHitTesting(false)
+                    .transition(.opacity)
+                }
+            }
+            .animation(.easeOut(duration: 0.12), value: targeted)
+    }
+}
+
+/// Turns dropped item providers into local files: file URLs as they are, image data (dragged out of a
+/// browser or Photos) written to a temporary file. Folders are skipped. Results keep the drop order.
+enum DroppedFiles {
+    static func load(_ providers: [NSItemProvider], completion: @escaping @MainActor ([URL]) -> Void) {
+        var results = [URL?](repeating: nil, count: providers.count)
+        let group = DispatchGroup()
+        let lock = NSLock()
+        for (i, p) in providers.enumerated() {
+            group.enter()
+            let done: (URL?) -> Void = { url in
+                lock.lock(); results[i] = url; lock.unlock()
+                group.leave()
+            }
+            if p.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+                p.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                    var url: URL?
+                    if let d = item as? Data { url = URL(dataRepresentation: d, relativeTo: nil) }
+                    else if let u = item as? URL { url = u }
+                    done(url.flatMap { $0.isFileURL && !$0.hasDirectoryPath ? $0 : nil })
+                }
+            } else if let type = p.registeredTypeIdentifiers.first(where: { UTType($0)?.conforms(to: .image) == true }) {
+                p.loadDataRepresentation(forTypeIdentifier: type) { data, _ in done(data.flatMap { write($0, type: type) }) }
+            } else {
+                done(nil)
+            }
+        }
+        group.notify(queue: .main) {
+            let files = results.compactMap { $0 }
+            MainActor.assumeIsolated { if !files.isEmpty { completion(files) } }
+        }
+    }
+
+    private static func write(_ data: Data, type: String) -> URL? {
+        var data = data
+        var ext = UTType(type)?.preferredFilenameExtension ?? "png"
+        if UTType(type)?.conforms(to: .tiff) == true {
+            guard let png = NSBitmapImageRep(data: data)?.representation(using: .png, properties: [:]) else { return nil }
+            data = png
+            ext = "png"
+        }
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("chatspace-\(UUID().uuidString).\(ext)")
+        return (try? data.write(to: url)) != nil ? url : nil
     }
 }
 
@@ -245,57 +337,6 @@ extension View {
 }
 
 // MARK: Popovers
-
-/// Search the loaded history of one chat; picking a result scrolls the conversation to it.
-struct InChatSearch: View {
-    let session: PlatformSession
-    let chatId: String
-    var placeholder = "Tìm tin nhắn"
-    @State private var q = ""
-    @Environment(\.dismiss) private var dismiss
-
-    var body: some View {
-        let needle = CustomGroup.normalize(q)
-        let hits = needle.isEmpty ? [] : (session.messages[chatId] ?? []).reversed().filter {
-            CustomGroup.normalize($0.text ?? $0.media?.fileName ?? "").contains(needle)
-        }
-        VStack(alignment: .leading, spacing: 8) {
-            TextField(placeholder, text: $q).textFieldStyle(.roundedBorder)
-            if !needle.isEmpty {
-                Text(hits.isEmpty ? "Không tìm thấy trong \(session.messages[chatId]?.count ?? 0) tin đã tải" : "\(hits.count) kết quả")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 2) {
-                    ForEach(hits.prefix(60)) { m in
-                        Button {
-                            session.scrollTarget[chatId] = m.id
-                            dismiss()
-                        } label: {
-                            VStack(alignment: .leading, spacing: 2) {
-                                HStack {
-                                    Text(m.fromMe ? "Bạn" : (m.senderName ?? "")).font(.system(size: 11, weight: .semibold))
-                                    Spacer()
-                                    Text(m.date, format: .dateTime.day().month().hour().minute()).font(.system(size: 10)).foregroundStyle(.secondary)
-                                }
-                                Text(m.text ?? m.media?.fileName ?? "").font(.system(size: 12)).lineLimit(2)
-                            }
-                            .padding(6).frame(maxWidth: .infinity, alignment: .leading)
-                            .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-            }
-            .frame(height: needle.isEmpty ? 0 : 260)
-            if !session.reachedStart.contains(chatId) && !needle.isEmpty {
-                Button("Tải thêm tin cũ để tìm") { session.loadOlder(chatId) }.font(.caption)
-            }
-        }
-        .padding(12)
-        .frame(width: 320)
-    }
-}
 
 /// Conversation info: who/what this chat is, plus ChatSpace actions.
 struct ChatInfoPanel: View {

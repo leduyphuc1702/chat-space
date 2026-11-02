@@ -94,16 +94,24 @@ struct ChatScroll<Content: View>: View {
             .task(id: chatId) {
                 settled = false
                 atBottom = true
+                // A search result opened in a chat that was not on screen yet lands on that message instead.
+                let target = session.scrollTarget[chatId]
+                if target != nil { atBottom = false }
                 // Lazy rows get their real heights over a few layout passes after the first scroll.
                 for ms in [0, 80, 250, 600] as [UInt64] {
                     try? await Task.sleep(nanoseconds: ms * 1_000_000)
                     if Task.isCancelled { return }
-                    if !messages.isEmpty || ms == 600 { proxy.scrollTo("bottom", anchor: .bottom) }
+                    if let target {
+                        proxy.scrollTo(target, anchor: .center)
+                    } else if !messages.isEmpty || ms == 600 {
+                        proxy.scrollTo("bottom", anchor: .bottom)
+                    }
                 }
                 if session.messages[chatId]?.isEmpty == false { settled = true }
+                if target != nil, session.scrollTarget[chatId] == target { session.scrollTarget[chatId] = nil }
             }
             .onChange(of: messages.isEmpty) { _, empty in
-                guard !empty, !settled else { return }
+                guard !empty, !settled, session.scrollTarget[chatId] == nil else { return }
                 Task {
                     for ms in [0, 80, 250] as [UInt64] {
                         try? await Task.sleep(nanoseconds: ms * 1_000_000)
@@ -114,7 +122,16 @@ struct ChatScroll<Content: View>: View {
             }
             .onChange(of: session.scrollTarget[chatId]) { _, id in
                 guard let id else { return }
-                withAnimation(.easeInOut(duration: 0.25)) { proxy.scrollTo(id, anchor: .center) }
+                atBottom = false
+                Task {
+                    // Rows above the target settle their heights after the first jump (it may be pages back).
+                    for ms in [0, 150, 400] as [UInt64] {
+                        try? await Task.sleep(nanoseconds: ms * 1_000_000)
+                        guard session.scrollTarget[chatId] == id else { return }
+                        withAnimation(.easeInOut(duration: ms == 0 ? 0.25 : 0.12)) { proxy.scrollTo(id, anchor: .center) }
+                    }
+                    settled = true
+                }
             }
             .overlay {
                 if messages.isEmpty && session.loadingHistory.contains(chatId) {
@@ -122,6 +139,21 @@ struct ChatScroll<Content: View>: View {
                 }
             }
         }
+    }
+}
+
+extension View {
+    /// Flashes the row a search result just jumped to.
+    func revealHighlight(_ session: PlatformSession, chatId: String, id: String) -> some View {
+        modifier(RevealHighlight(on: session.highlighted[chatId] == id))
+    }
+}
+
+private struct RevealHighlight: ViewModifier {
+    let on: Bool
+
+    func body(content: Content) -> some View {
+        content.background(Color(hex: 0xFFD60A).opacity(on ? 0.3 : 0).animation(.easeInOut(duration: 0.45), value: on))
     }
 }
 
