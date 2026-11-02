@@ -48,7 +48,8 @@ final class Updater {
     }
 
     func start() {
-        guard supported else { return }
+        guard supported else { Self.log("disabled for \(Bundle.main.bundleURL.path)"); return }
+        Self.log("started \(currentVersion) at \(Bundle.main.bundleURL.path)")
         Self.cleanLeftovers()
         timer = Timer.scheduledTimer(withTimeInterval: Self.interval, repeats: true) { _ in
             Task { @MainActor in if Updater.shared.automatic { await Updater.shared.check() } }
@@ -66,21 +67,25 @@ final class Updater {
         default: break
         }
         state = .checking
+        Self.log("checking (current \(currentVersion))")
         do {
             let release = try await Self.latestRelease()
             lastCheck = Date()
             let version = release.tag_name.trimmingCharacters(in: CharacterSet(charactersIn: "vV"))
-            guard Self.isNewer(version, than: currentVersion) else { state = .upToDate; return }
+            guard Self.isNewer(version, than: currentVersion) else { state = .upToDate; Self.log("up to date (latest \(version))"); return }
             guard let asset = release.assets.first(where: { $0.name == Self.assetName }) else {
                 state = .upToDate // release published before its macOS build was attached
                 return
             }
             state = .downloading(version)
+            Self.log("downloading \(version)")
             staged = try await Self.stage(asset, version: version)
             state = .ready(version)
+            Self.log("ready \(version)")
         } catch {
             lastCheck = Date()
             state = .failed(error.localizedDescription)
+            Self.log("failed: \(error)")
         }
     }
 
@@ -116,6 +121,7 @@ final class Updater {
                        Bundle.main.bundleURL.path, staged.path, relaunch ? "1" : "0"]
         do {
             try p.run()
+            Self.log("installing (relaunch \(relaunch))")
             self.staged = nil
             return true
         } catch {
@@ -218,6 +224,20 @@ final class Updater {
         let parent = Bundle.main.bundleURL.deletingLastPathComponent()
         try? FileManager.default.removeItem(at: parent.appendingPathComponent(".ChatSpace-update"))
         try? FileManager.default.removeItem(at: Bundle.main.bundleURL.appendingPathExtension("previous"))
+    }
+
+    private static let logURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("ChatSpace/updater.log")
+
+    static func log(_ line: String) {
+        let text = "\(Date().ISO8601Format()) \(line)\n"
+        if let h = try? FileHandle(forWritingTo: logURL) {
+            _ = try? h.seekToEnd()
+            try? h.write(contentsOf: Data(text.utf8))
+            try? h.close()
+        } else {
+            try? Data(text.utf8).write(to: logURL)
+        }
     }
 
     nonisolated static func isNewer(_ a: String, than b: String) -> Bool {
