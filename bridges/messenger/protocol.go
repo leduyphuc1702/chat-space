@@ -4,8 +4,10 @@ package main
 // All timestamps are milliseconds since epoch; all IDs are strings.
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 )
 
 type SelfInfo struct {
@@ -193,6 +195,20 @@ func (p params) intOr(key string, def int) int {
 		return def
 	}
 	return int(f)
+}
+
+// integer reads a whole-number param that may be zero or negative (intOr only takes
+// positives); ok is false when it is missing, null, not a number or not a whole number.
+func (p params) integer(key string) (n int64, ok bool) {
+	raw, has := p[key]
+	if !has || string(bytes.TrimSpace(raw)) == "null" { // null would decode as 0
+		return 0, false
+	}
+	var f float64
+	if json.Unmarshal(raw, &f) != nil || f != math.Trunc(f) || math.Abs(f) > 1<<53 {
+		return 0, false
+	}
+	return int64(f), true
 }
 
 func (p params) boolean(key string) bool {

@@ -54,6 +54,17 @@ export abstract class Adapter {
     throw new BridgeError("unsupported", "forward is not supported");
   }
   abstract markRead(chatId: string): Promise<void>;
+  /**
+   * chats.mute (capability "mute"): `until` is the ms epoch the mute ends, -1 = forever, 0 = unmute.
+   * Returns the chat with its new mute state (also emitted as chat.upsert).
+   */
+  async muteChat(_chatId: string, _until: number): Promise<Chat> {
+    throw new BridgeError("unsupported", "mute is not supported");
+  }
+  /** chats.pins (capability "pins"): the chat's pinned messages, most recently pinned first. */
+  async pinnedMessages(_chatId: string): Promise<Message[]> {
+    throw new BridgeError("unsupported", "pinned messages are not supported");
+  }
   /** Members of a group chat (the other participant of a 1:1 chat). Adapters with capability "mentions" override this. */
   async chatMembers(_chatId: string): Promise<Member[]> {
     throw new BridgeError("unsupported", "chats.members is not supported");

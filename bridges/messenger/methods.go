@@ -149,6 +149,82 @@ func (b *bridge) chatMembers(ctx context.Context, chat string) ([]Member, error)
 	return members, nil
 }
 
+// chats.mute -----------------------------------------------------------------
+
+// muteThreadKey is the LightSpeed thread a chat is muted on. An encrypted chat has
+// one only once Meta told us its hybrid thread (Key, as markRead relies on). Before
+// that its id is the WhatsApp-side JID user, which for a 1:1 chat is the peer's id:
+// the key of the unencrypted thread, so muting it would mute the wrong thread.
+func muteThreadKey(t threadRec) (int64, error) {
+	if !t.E2EE {
+		return threadKeyOf(t)
+	}
+	if t.Key == 0 {
+		return 0, newErr(codeUnsupported, "chat %s is end-to-end encrypted and Messenger has not sent its thread yet, so it cannot be muted from here", t.ID)
+	}
+	return t.Key, nil
+}
+
+// muteChat sends one MuteThreadTask (no retry; it only ever runs for an explicit
+// chats.mute) and stores the new setting the way LSUpdateThreadMuteSetting does.
+// until is the ms epoch the mute ends, -1 = forever, 0 = unmute.
+func (b *bridge) muteChat(ctx context.Context, chat string, until int64) (Chat, error) {
+	if until < -1 {
+		return Chat{}, newErr(codeInvalidParams, "until must be a ms epoch, -1 (forever) or 0 (unmute)")
+	}
+	if err := b.requireRead(); err != nil {
+		return Chat{}, err
+	}
+	t, err := b.lookupThread(chat)
+	if err != nil {
+		return Chat{}, err
+	}
+	key, err := muteThreadKey(t)
+	if err != nil {
+		return Chat{}, err
+	}
+	client, err := b.requireClient()
+	if err != nil {
+		return Chat{}, err
+	}
+	resp, err := client.ExecuteTasks(ctx, &socket.MuteThreadTask{ThreadKey: key, MailboxType: 0, MuteExpireTimeMS: until, SyncGroup: 1})
+	if err != nil {
+		return Chat{}, fmt.Errorf("failed to mute chat: %w", err)
+	}
+	if resp != nil {
+		for _, f := range resp.LSHandleFailedTask {
+			return Chat{}, fmt.Errorf("Messenger rejected the mute: %s", f.Message)
+		}
+	}
+	snap, _ := b.st.updateThread(chat, func(t *threadRec) { t.MuteUntil = until })
+	b.emitChat(chat)
+	return b.chatView(snap), nil
+}
+
+// chats.pins ------------------------------------------------------------------
+
+// chatPins lists the pinned messages of a chat, newest pin first, from the pins the
+// sync tables delivered (tables.go pins). A pin whose message is not stored (older
+// than what we keep) is a bare placeholder at its pin time, so it is still listed.
+func (b *bridge) chatPins(chat string) ([]Message, error) {
+	if err := b.requireRead(); err != nil {
+		return nil, err
+	}
+	if _, err := b.lookupThread(chat); err != nil {
+		return nil, err
+	}
+	pins := b.st.pinList(chat)
+	out := make([]Message, 0, len(pins))
+	for _, p := range pins {
+		if m, ok := b.st.message(chat, p.ID); ok {
+			out = append(out, m.Message)
+		} else {
+			out = append(out, Message{ID: p.ID, ChatID: chat, Timestamp: p.At, Kind: "unsupported"})
+		}
+	}
+	return out, nil
+}
+
 // messages.list --------------------------------------------------------------
 
 func (b *bridge) listMessages(ctx context.Context, chat string, limit int, before string) ([]Message, error) {

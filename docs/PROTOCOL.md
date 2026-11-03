@@ -154,6 +154,8 @@ interface Message {
 | `messages.send` | `{ chatId, text?, replyTo?: string, filePath?: string, mentions?: { userId: string, offset: number, length: number }[] }` | `{ message: Message }` |
 | `messages.forward` | `{ fromChatId, messageId, toChatId }` | `{ message: Message }` (capability `forward`, see [Forwarding](#forwarding)) |
 | `messages.markRead` | `{ chatId }` | `{}` |
+| `chats.mute` | `{ chatId, until: number /* ms epoch; -1 = forever; 0 = unmute */ }` | `{ chat: Chat }` (capability `mute`, see [Muting](#muting)) |
+| `chats.pins` | `{ chatId }` | `{ messages: Message[] }` (most recently pinned first; capability `pins`, see [Pinned messages](#pinned-messages)) |
 | `messages.react` | `{ chatId, messageId, emoji }` (empty emoji = remove) | `{}` |
 | `messages.delete` | `{ chatId, messageId, forEveryone?: boolean }` | `{}` |
 | `messages.edit` | `{ chatId, messageId, text, mentions? }` | `{ message: Message }` (capability `edit`, see [Editing](#editing)) |
@@ -195,6 +197,48 @@ again automatically while the QR screen is visible.
 
 `capabilities` tells the UI which actions to show, e.g.
 `["reactions","reply","delete","edit","typing","read_receipts","media_send","voice","mentions","search"]`.
+
+### Muting
+
+Capability `mute` means the bridge implements `chats.mute`, which turns a chat's notifications off on the
+platform itself (so the phone and other devices follow) until `until`, or forever (`-1`), or back on (`0`).
+The result is the chat with its new `muted`/`mutedUntil`; the bridge also emits `chat.upsert`. A mute
+changed on another device arrives as `chat.upsert` like any other chat change. Each platform keeps its own
+granularity: the app offers the durations of the official app, and bridges pass them through as given.
+
+- **Telegram**: `account.updateNotifySettings` (`muteUntil` in seconds; forever = 2^31−1).
+- **WhatsApp**: app-state `mute` (`muteEndTimestamp` = the end as an absolute ms epoch; forever = −1; unmute
+  sends no timestamp).
+- **Zalo**: `setmute` with the remaining duration in seconds, or forever.
+- **Messenger**: `MuteThreadTask` (`mute_expire_time_ms`; −1 forever, 0 unmute). Sent only when the user
+  asks; it is a single task with no retry. An end-to-end encrypted chat whose Facebook thread is not known
+  yet answers `unsupported`.
+
+### Pinned messages
+
+Capability `pins` means the bridge implements `chats.pins` and emits `pins.update`. `chats.pins` returns the
+messages pinned in a chat, most recently pinned first, as full `Message` objects with the id of the original
+message (so the app can scroll to it). When the original is not stored locally the bridge fills what the
+platform gives with the pin (sender, text or kind); `text` may then be a preview. An unpinned chat returns `[]`.
+
+- **Telegram**: `messages.search` with `inputMessagesFilterPinned` (up to 100). Telegram does not say when a
+  message was pinned, so the order is newest message first, as in its own pinned bar. `pins.update` on
+  `updatePinnedMessages` / `updatePinnedChannelMessages`, on the "pinned a message" service message, and when a
+  pinned message is edited or deleted.
+- **WhatsApp**: there is no server query: the bridge records `pinInChatMessage` (pin/unpin, with expiry) from
+  live, offline and history-sync messages, at most 3 per chat. `pins.update` on every change and when a pin
+  lapses. Pins made before the bridge first synced the chat may be missing.
+- **Zalo**: the group board (`board/list`, first 50 items, pinned-message ones) and the 1:1 friend board, newest
+  pin first. A pin carries the message ids, sender and a title or thumbnail but not the send time, so a message
+  that is not stored comes back with the pin time as `timestamp`. `pins.update` on the group's pin/unpin/reorder
+  topic events (and board changes to a message topic) and on the 1:1 pin/unpin events.
+- **Messenger**: `LSSetPinnedMessage` / `LSClearPinnedMessages` as they arrive with thread sync, kept per
+  thread in the bridge's store; the bridge never asks Meta for pins, so pins made before the bridge first
+  synced the chat may be missing. A pin without a timestamp counts as an unpin. A pin whose message is no
+  longer stored comes back as a placeholder (`kind: "unsupported"`, no sender, `timestamp` = pin time).
+
+`pins.update { chatId }` tells the app the pins of a chat changed (on any device); the app calls `chats.pins`
+again if it shows that chat.
 
 ### Mentions
 
@@ -347,6 +391,7 @@ either form and strips U+FE0F before talking to Telegram, whose reaction set use
 | `typing` | `{ chatId, userId, name?, typing: boolean }` |
 | `presence` | `{ chatId, online: boolean, lastSeen?: number }` |
 | `history.phoneSync` | `PhoneSyncProgress` — Zalo phone sync progress (see [Zalo phone sync](#zalo-phone-sync)) |
+| `pins.update` | `{ chatId }` — the chat's pinned messages changed (see [Pinned messages](#pinned-messages)) |
 | `log` | `{ level: "info" \| "warn" \| "error", message }` |
 
 ## Session storage

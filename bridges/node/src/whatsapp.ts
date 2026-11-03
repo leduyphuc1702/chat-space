@@ -48,17 +48,20 @@ import {
   type Message,
   type StorageConfig,
 } from "./types.ts";
-import { fallbackName, isStorable, mapMessage, mediaContent, statusOf, type MapCtx } from "./whatsapp-map.ts";
+import { fallbackName, isStorable, mapMessage, mediaContent, pinEvent, statusOf, type MapCtx } from "./whatsapp-map.ts";
 import {
   MAX_MESSAGES_PER_CHAT,
   WAStore,
   applyReaction,
   applyReceipt,
   editedContent,
+  muteArg,
+  muteEndMs,
   normJid,
   num,
   plainContent,
   plainMsg,
+  type PinEvent,
   type StoredChat,
   type StoredMsg,
 } from "./whatsapp-store.ts";
@@ -82,7 +85,7 @@ const safeName = (s: string) => s.replace(/[^A-Za-z0-9._-]/g, "_");
 export class WhatsAppAdapter extends Adapter {
   readonly platform = "whatsapp";
   // "edit" is deliberately absent: the protocol has no edit method yet (edits are received and shown).
-  readonly capabilities = ["reactions", "reply", "delete", "edit", "typing", "read_receipts", "media_send", "voice", "presence", "mentions", "forward", "search"];
+  readonly capabilities = ["reactions", "reply", "delete", "edit", "typing", "read_receipts", "media_send", "voice", "presence", "mentions", "forward", "search", "mute", "pins"];
 
   private store: WAStore;
   private readonly authDir: string;
@@ -142,6 +145,11 @@ export class WhatsAppAdapter extends Adapter {
   private ownSending = new Set<string>();
   private pendingUpserts = new Set<string>();
   private upsertTimer?: ReturnType<typeof setTimeout>;
+  private pendingPins = new Set<string>();
+  private pinsTimer?: ReturnType<typeof setTimeout>;
+  /** wakes up when the next active pin lapses, so the app drops it without being asked */
+  private pinExpiryTimer?: ReturnType<typeof setTimeout>;
+  private pinSweptAt = Date.now();
   /** Chats the app already knows about (sent in a chat.upsert or chats.list this process). */
   private announced = new Set<string>();
   /** Read receipts that could not be sent (offline / failed); flushed when the socket opens again. */
@@ -191,7 +199,11 @@ export class WhatsAppAdapter extends Adapter {
     mkdirSync(this.authDir, { recursive: true });
     this.loadBrowserChoice();
     this.store.load();
-    this.store.onMerge = (to) => this.queueChatUpsert(to);
+    this.store.onMerge = (to) => {
+      this.queueChatUpsert(to);
+      if (this.store.pins.has(to)) this.queuePinsUpdate(to);
+    };
+    this.armPinExpiry();
     if (this.store.accountId) {
       const user = jidDecode(this.store.accountId)?.user;
       this.self = { id: this.store.accountId, name: this.store.accountName || user || "", phone: user };
@@ -294,6 +306,8 @@ export class WhatsAppAdapter extends Adapter {
     this.stopping = true;
     clearTimeout(this.reconnectTimer);
     clearTimeout(this.upsertTimer);
+    clearTimeout(this.pinsTimer);
+    clearTimeout(this.pinExpiryTimer);
     clearTimeout(this.idleTimer);
     this.clearQrWatch();
     if (this.groupTimer) clearInterval(this.groupTimer);
@@ -664,13 +678,16 @@ export class WhatsAppAdapter extends Adapter {
   private async ingest(m: WAMessage): Promise<{ chatId: string; sm: StoredMsg; created: boolean } | null> {
     const key = m.key;
     if (!key?.id || !key.remoteJid || this.skipJid(key.remoteJid)) return null;
-    if (!isStorable(m)) return null;
+    const pin = pinEvent(m);
+    if (!pin && !isStorable(m)) return null;
     if (key.remoteJidAlt) this.store.linkAny(key.remoteJid, key.remoteJidAlt);
     if (key.participant && key.participantAlt) this.store.linkAny(key.participant, key.participantAlt);
     await this.resolveLid(key.remoteJid);
     await this.resolveLid(key.participant);
     const chatId = this.store.canon(key.remoteJid);
     if (!chatId || this.skipJid(chatId)) return null;
+    if (pin) this.notePin(chatId, pin);
+    if (!isStorable(m)) return null; // an unpin: recorded, nothing to show
 
     if (!key.fromMe && (m.pushName || m.verifiedBizName)) {
       const sender = isJidGroup(chatId) ? this.store.canon(key.participant) : chatId;
@@ -894,10 +911,7 @@ export class WhatsAppAdapter extends Adapter {
       }
     }
     if ("muteEndTime" in c) {
-      const n = c.muteEndTime == null ? 0 : num(c.muteEndTime);
-      // Seconds in history chunks, ms in app-state patches; -1 (or a date centuries away) = forever.
-      let ms = n < 0 ? -1 : n === 0 ? 0 : n > 1e12 ? n : n * 1000;
-      if (ms > 4e12) ms = -1;
+      const ms = muteEndMs(c.muteEndTime);
       if ((sc.muteEnd ?? 0) !== ms) {
         sc.muteEnd = ms || undefined;
         dirty = true;
@@ -1099,6 +1113,40 @@ export class WhatsAppAdapter extends Adapter {
       this.pendingUpserts.clear();
       for (const cid of ids) this.emitChat(cid);
     }, delay);
+  }
+
+  private notePin(chatId: string, e: PinEvent) {
+    if (!this.store.applyPin(chatId, e)) return;
+    this.queuePinsUpdate(chatId);
+    this.armPinExpiry();
+  }
+
+  /** pins.update, batched: a history sync can carry many pin events for one chat. */
+  private queuePinsUpdate(chatId: string) {
+    this.pendingPins.add(chatId);
+    if (this.pinsTimer) return;
+    this.pinsTimer = setTimeout(() => {
+      this.pinsTimer = undefined;
+      const ids = [...this.pendingPins];
+      this.pendingPins.clear();
+      for (const id of ids) this.ctx.emit("pins.update", { chatId: id });
+    }, 300);
+  }
+
+  private armPinExpiry() {
+    clearTimeout(this.pinExpiryTimer);
+    this.pinExpiryTimer = undefined;
+    const at = this.store.nextPinExpiry();
+    if (at === undefined || this.stopping) return;
+    // setTimeout overflows past 2^31 ms; an early wake-up just re-arms.
+    this.pinExpiryTimer = setTimeout(() => {
+      this.pinExpiryTimer = undefined;
+      const now = Date.now();
+      for (const id of this.store.lapsedPinChats(this.pinSweptAt, now)) this.queuePinsUpdate(id);
+      this.pinSweptAt = now;
+      this.armPinExpiry();
+    }, Math.min(Math.max(at - Date.now(), 0) + 50, 2 ** 31 - 1));
+    (this.pinExpiryTimer as any).unref?.();
   }
 
   /** Emit a chat.upsert right now (no debounce) and drop any pending one for the same chat. */
@@ -1538,6 +1586,42 @@ export class WhatsAppAdapter extends Adapter {
         return;
       }
     }
+  }
+
+  /**
+   * chats.mute: app-state `mute`, synced to the phone. The end is an absolute ms timestamp (Baileys' README example
+   * passes a duration, which would be long past) and "Always" is -1. Baileys echoes our own patch as a chats.update
+   * with that muteEndTime, which muteEndMs reads back to the same value.
+   */
+  async muteChat(chatId: string, until: number): Promise<Chat> {
+    const sock = this.requireSock();
+    const cid = this.store.canon(chatId);
+    const sc = this.store.getChat(cid);
+    if (!sc) throw new BridgeError("not_found", "chat not found");
+    if (!Number.isFinite(until) || (until > 0 && until <= Date.now())) throw new BridgeError("invalid_params", "until must be in the future, -1 or 0");
+    const mute = muteArg(until);
+    await sock.chatModify({ mute }, cid);
+    sc.muteEnd = mute ?? undefined;
+    this.store.touchIndex();
+    this.emitChatNow(cid);
+    return this.buildChat(sc);
+  }
+
+  /** chats.pins: the pins recorded from pinInChatMessage, each as the stored original so the app can scroll to it. */
+  async pinnedMessages(chatId: string): Promise<Message[]> {
+    this.requireData();
+    const cid = this.store.canon(chatId);
+    const out: Message[] = [];
+    for (const p of this.store.activePins(cid)) {
+      const sm = this.store.getMsg(cid, p.id);
+      if (!sm) {
+        out.push({ id: p.id, chatId: cid, senderId: "", fromMe: false, timestamp: p.pinnedAt, kind: "unsupported" });
+        continue;
+      }
+      const msg = mapMessage(sm, cid, this.mc);
+      if (msg && !msg.deleted) out.push(msg);
+    }
+    return out;
   }
 
   async react(chatId: string, messageId: string, emoji: string): Promise<void> {

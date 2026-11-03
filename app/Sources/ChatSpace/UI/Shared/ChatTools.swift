@@ -342,9 +342,11 @@ extension View {
 struct ChatInfoPanel: View {
     let session: PlatformSession
     let chat: Chat
+    @State private var choosingMute = false
 
     var body: some View {
         let ref = ChatRef(platform: session.platform, chatId: chat.id)
+        let chat = session.chats.first { $0.id == self.chat.id } ?? self.chat
         VStack(spacing: 10) {
             AvatarView(source: chat.avatar, size: 72) {
                 Circle().fill(Color.gray.opacity(0.3))
@@ -357,7 +359,7 @@ struct ChatInfoPanel: View {
             }
             Divider()
             VStack(alignment: .leading, spacing: 6) {
-                info("Thông báo", chat.isMuted ? "Đã tắt" : "Đang bật")
+                info("Thông báo", chat.muteDescription ?? "Đang bật")
                 if chat.hasUnread { info("Chưa đọc", chat.unread > 0 ? "\(chat.unread) tin" : "Đánh dấu chưa đọc") }
                 info("Tin đã tải", "\(session.messages[chat.id]?.count ?? 0)")
                 let groups = Workspace.shared.groups.filter { $0.matches(chat, on: session.platform) }
@@ -365,6 +367,19 @@ struct ChatInfoPanel: View {
             }
             Divider()
             VStack(spacing: 6) {
+                if session.can("mute") {
+                    if chat.isMuted {
+                        Button("Bật thông báo") { session.setMute(chat.id, until: 0) }
+                    } else if choosingMute {
+                        Text("Tắt thông báo").font(.caption).foregroundStyle(.secondary)
+                        ForEach(MuteOption.options(session.platform)) { o in
+                            Button(o.label) { choosingMute = false; session.setMute(chat.id, until: o.until) }
+                        }
+                        Button("Huỷ") { choosingMute = false }.foregroundStyle(.secondary)
+                    } else {
+                        Button("Tắt thông báo") { choosingMute = true }
+                    }
+                }
                 Button("Mở bong bóng chat") { ChatHeads.shared.show(ref, expand: true) }
                 if Workspace.shared.isIgnored(ref) {
                     Button("Hiện lại trong Chưa đọc của ChatSpace") { Workspace.shared.restore(ref) }

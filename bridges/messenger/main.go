@@ -30,7 +30,7 @@ const (
 	requestTimeout = 3 * time.Minute
 )
 
-var capabilities = []string{"reactions", "reply", "delete", "edit", "typing", "read_receipts", "media_send", "password_login", "mentions", "open_history", "history_pin", "search"}
+var capabilities = []string{"reactions", "reply", "delete", "edit", "typing", "read_receipts", "media_send", "password_login", "mentions", "open_history", "history_pin", "search", "mute", "pins"}
 
 // frameWriter serialises every frame written to stdout.
 type frameWriter struct {
@@ -262,6 +262,32 @@ func (s *server) routes() map[string]handler {
 				return nil, err
 			}
 			return map[string]any{"members": members}, nil
+		},
+		"chats.mute": func(ctx context.Context, p params) (any, error) {
+			id, err := p.need("chatId")
+			if err != nil {
+				return nil, err
+			}
+			until, ok := p.integer("until")
+			if !ok {
+				return nil, newErr(codeInvalidParams, "until is required (ms epoch, -1 = forever, 0 = unmute)")
+			}
+			chat, err := b.muteChat(ctx, id, until)
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{"chat": chat}, nil
+		},
+		"chats.pins": func(ctx context.Context, p params) (any, error) {
+			id, err := p.need("chatId")
+			if err != nil {
+				return nil, err
+			}
+			msgs, err := b.chatPins(id)
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{"messages": msgs}, nil
 		},
 		"messages.list": func(ctx context.Context, p params) (any, error) {
 			id, err := p.need("chatId")

@@ -350,6 +350,7 @@ struct WhatsAppConversation: View {
     var body: some View {
         VStack(spacing: 0) {
             header
+            PinnedBar(session: session, chat: chat)
             ZStack {
                 WhatsAppWallpaper()
                 ChatScroll(session: session, chatId: chat.id, spacing: 0,

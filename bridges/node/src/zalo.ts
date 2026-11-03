@@ -5,10 +5,13 @@ import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import {
   AvatarSize,
+  BoardType,
   CloseReason,
   FriendEventType,
   GroupEventType,
+  GroupTopicType,
   LoginQRCallbackEventType,
+  MuteAction,
   Reactions,
   ThreadType,
   Zalo,
@@ -47,10 +50,13 @@ import {
   mapContent,
   mimeFromName,
   parseChatId,
+  parsePinTopics,
+  pinToMessage,
   quoteToReply,
   readImageMeta,
   str,
   toMs,
+  type PinTopic,
 } from "./zalo-map.ts";
 import { MAX_PER_CHAT, ZaloStore, type Entry, type ZMeta } from "./zalo-store.ts";
 import { DEFAULT_ASAR as ZALO_ASAR, readWasmFromAsar } from "./zalo-sync2/asar.ts";
@@ -79,10 +85,30 @@ const NOTIFY_POLL_MS = 5 * 60_000;
 const OLDER_HISTORY_MAX = 500;
 /** getMute `muteMode` of an entry that was switched off again (zca-js MuteAction.UNMUTE). */
 const MUTE_MODE_OFF = 3;
+/** A mute set through chats.mute is not overwritten by a getMute poll that started within this long before it (or after). */
+const MUTE_SETTLE_MS = 15_000;
 /** chats.members answers are reused this long per chat (typing "@" repeatedly must not hit Zalo each time). */
 const MEMBERS_TTL_MS = 5 * 60_000;
+/** chats.pins answers are reused this long per chat; pin events drop them sooner. */
+const PINS_TTL_MS = 5 * 60_000;
+/** Board items asked per chats.pins (getListBoard returns notes and polls too, in one list). */
+const PINS_BOARD_COUNT = 50;
 /** getGroupMembersInfo is asked for this many unknown member names per request. */
 const MEMBER_INFO_CHUNK = 50;
+/** Group events that add, remove or reorder pinned messages. */
+const PIN_EVENTS = new Set<string>([
+  GroupEventType.NEW_PIN_TOPIC,
+  GroupEventType.UPDATE_PIN_TOPIC,
+  GroupEventType.UNPIN_TOPIC,
+  GroupEventType.REORDER_PIN_TOPIC,
+]);
+/** Board events for any kind of topic; they touch the pins only when the topic is a message. */
+const BOARD_EVENTS = new Set<string>([
+  GroupEventType.UPDATE_BOARD,
+  GroupEventType.REMOVE_BOARD,
+  GroupEventType.UPDATE_TOPIC,
+  GroupEventType.REMOVE_TOPIC,
+]);
 /** Phone sync: conversations per page of the conversation list (Zalo PC's conversations_batch_size). */
 const SYNC_CONV_PAGE = 1000;
 /** Phone sync: conversations per message request (Zalo PC never puts more than 30 queries in one). */
@@ -212,12 +238,19 @@ export class ZaloAdapter extends Adapter {
     "media_send",
     "mentions",
     "search",
+    "mute",
+    "pins",
     // the transfer is decrypted with Zalo's own library, read from the installed Zalo PC
     ...(existsSync(ZALO_ASAR) ? ["phone_sync"] : []),
   ];
 
   private store: ZaloStore;
   private membersCache = new TtlCache<Member[]>(MEMBERS_TTL_MS);
+  private pinsCache = new TtlCache<PinTopic[]>(PINS_TTL_MS);
+  /** chatId -> bumped by every pin event, so a fetch that raced one can be repeated */
+  private pinsVer = new Map<string, number>();
+  /** chatId -> when chats.mute last changed it (see MUTE_SETTLE_MS) */
+  private muteWrites = new Map<string, number>();
   private api?: API;
   private creds?: StoredCredentials;
   private selfId = "";
@@ -358,6 +391,9 @@ export class ZaloAdapter extends Adapter {
     this.store.reset();
     this.stickerCache.clear();
     this.membersCache.clear();
+    this.pinsCache.clear();
+    this.pinsVer.clear();
+    this.muteWrites.clear();
     this.histFetched.clear();
     this.historyDone.clear();
     this.friendsKnown = false;
@@ -720,6 +756,7 @@ export class ZaloAdapter extends Adapter {
       if (!live()) return;
       this.hookRawSocket(l, gen);
       this.connectedAt = Date.now();
+      this.pinsCache.clear(); // pin events missed while offline
       if (this.connectWatch) clearTimeout(this.connectWatch);
       this.connectWatch = undefined;
       this.emitConn("online");
@@ -1440,6 +1477,7 @@ export class ZaloAdapter extends Adapter {
 
   /** getMute -> chat.muted / mutedUntil. Returns the ids of chats whose mute state changed. */
   private async loadMuted(api: API): Promise<string[]> {
+    const startedAt = Date.now();
     const res = await withTimeout(api.getMute(), 15_000, "getMute");
     const now = Date.now();
     const next = new Map<string, number>(); // chatId -> mutedUntil (ms epoch, -1 = forever)
@@ -1462,6 +1500,8 @@ export class ZaloAdapter extends Adapter {
     const ids = new Set<string>(next.keys());
     for (const [id, c] of Object.entries(this.store.chats)) if (c.muted || c.mutedUntil !== undefined) ids.add(id);
     for (const id of ids) {
+      // This answer may predate (or not yet include) a mute the user just set: keep that one, the next poll settles it.
+      if ((this.muteWrites.get(id) ?? 0) > startedAt - MUTE_SETTLE_MS) continue;
       const sc = this.store.chat(id);
       const was = sc.mutedUntil ?? (sc.muted ? -1 : undefined); // a bare legacy `muted` meant forever
       const to = next.get(id);
@@ -2081,12 +2121,32 @@ export class ZaloAdapter extends Adapter {
 
   private applyFriendEvent(ev: ZFriendEvent) {
     if (ev.type === FriendEventType.ADD || ev.type === FriendEventType.REMOVE) this.scheduleDirRefresh();
+    if (ev.type === FriendEventType.PIN_CREATE || ev.type === FriendEventType.PIN_UNPIN) {
+      // Whether `conversationId` is the peer when the peer pinned is not documented: cover the actor's chat too.
+      const threadId = str(ev.threadId);
+      const actorId = str(ev.data.actorId);
+      const chats = new Set<string>();
+      for (const uid of [threadId, actorId]) {
+        const id = uid && (uid !== this.selfId || uid === threadId) ? this.convToChatId(uid) : undefined;
+        if (id) chats.add(id);
+      }
+      for (const id of chats) this.pinsChanged(id);
+    }
   }
 
   private applyGroupEvent(ev: ZGroupEvent) {
     const gid = str(ev.threadId);
     const chatId = chatIdOf(ThreadType.Group, gid);
     const d = ev.data as any;
+    if (PIN_EVENTS.has(ev.type)) {
+      this.pinsChanged(chatId);
+      return;
+    }
+    if (BOARD_EVENTS.has(ev.type)) {
+      const topicType = Number(d.groupTopic?.type);
+      if (Number.isNaN(topicType) || topicType === GroupTopicType.Message) this.pinsChanged(chatId);
+      return;
+    }
     const members: any[] = Array.isArray(d.updateMembers) ? d.updateMembers : [];
     for (const mem of members) {
       if (mem && typeof mem === "object" && mem.id) this.remember(str(mem.id), nonEmpty(mem.dName), nonEmpty(mem.avatar));
@@ -2431,6 +2491,77 @@ export class ZaloAdapter extends Adapter {
       // Local unread is already cleared; the next markRead retries the receipt.
       this.log("sendSeenEvent failed", errMsg(e));
     }
+  }
+
+  async muteChat(chatId: string, until: number): Promise<Chat> {
+    this.requireLogin();
+    const { type, id } = parseChatId(chatId);
+    const now = Date.now();
+    const off = until === 0 || (until > 0 && until <= now);
+    // Zalo wants the remaining time in seconds (-1 = forever).
+    const seconds = until === -1 ? -1 : Math.ceil((until - now) / 1000);
+    const params = off ? { action: MuteAction.UNMUTE } : { duration: seconds, action: MuteAction.MUTE };
+    await withTimeout(this.api!.setMute(params, id, type), 15_000, "setMute");
+    const sc = this.store.chat(chatId);
+    sc.muted = !off;
+    sc.mutedUntil = off ? undefined : seconds === -1 ? -1 : now + seconds * 1000;
+    this.muteWrites.set(chatId, Date.now());
+    this.store.touch();
+    this.emitChatNow(chatId);
+    return this.buildChat(chatId);
+  }
+
+  async pinnedMessages(chatId: string): Promise<Message[]> {
+    this.requireLogin();
+    parseChatId(chatId);
+    const pins = await this.pinsCache.getOrLoad(chatId, () => this.loadPins(chatId));
+    const out: Message[] = [];
+    for (const pin of pins) out.push(await this.pinMessage(chatId, pin));
+    return out;
+  }
+
+  /** Group: the pinned-message items of the group board. 1:1: the friend board. */
+  private async loadPins(chatId: string): Promise<PinTopic[]> {
+    const api = this.api!;
+    const { type, id } = parseChatId(chatId);
+    for (let tries = 0; ; tries++) {
+      const ver = this.pinsVer.get(chatId) ?? 0;
+      let items: unknown[];
+      if (type === ThreadType.Group) {
+        const board = await withTimeout(api.getListBoard({ count: PINS_BOARD_COUNT }, id), 15_000, "getListBoard");
+        items = (board.items ?? []).filter((it) => it.boardType === BoardType.PinnedMessage).map((it) => it.data);
+      } else {
+        items = (await withTimeout(api.getFriendBoardList(id), 15_000, "getFriendBoardList")).data ?? [];
+      }
+      // A pin event that came in while Zalo was answering may not be in this answer: ask once more.
+      if ((this.pinsVer.get(chatId) ?? 0) === ver || tries >= 1) return parsePinTopics(items);
+    }
+  }
+
+  /** The stored original when we have it (same id as messages.list), else a message built from the pin itself. */
+  private async pinMessage(chatId: string, pin: PinTopic): Promise<Message> {
+    const sender = pin.senderUid === "0" ? this.selfId : pin.senderUid;
+    const byCli = this.store.findByCli(chatId, pin.cliMsgId);
+    const stored =
+      (pin.msgId ? this.store.find(chatId, pin.msgId) : undefined) ??
+      (byCli && (!sender || byCli.m.senderId === sender) ? byCli : undefined); // cliMsgIds repeat across senders
+    if (stored) return this.outbound(stored.m);
+
+    const m = pinToMessage(pin, chatId, this.selfId);
+    if (pin.mapped.sticker) {
+      m.media = (await this.resolveSticker(pin.mapped.sticker.id)) ?? m.media;
+      m.text = m.media?.url ? undefined : "[Sticker]";
+    }
+    m.senderName = this.nameOf(m.senderId) ?? m.senderName;
+    m.senderAvatar = m.fromMe ? this.self?.avatar : this.store.contacts[m.senderId]?.avatar;
+    return m;
+  }
+
+  /** The pins of a chat changed (event from Zalo): forget what we know and tell the app. */
+  private pinsChanged(chatId: string) {
+    this.pinsVer.set(chatId, (this.pinsVer.get(chatId) ?? 0) + 1);
+    this.pinsCache.delete(chatId);
+    this.ctx.emit("pins.update", { chatId });
   }
 
   async react(chatId: string, messageId: string, emoji: string): Promise<void> {

@@ -44,10 +44,12 @@ import {
   entityName,
   hasProfilePhoto,
   isMinEntity,
+  isPinNotice,
   mapFolders,
   mapMessage,
   mapReactions,
   muteInfo,
+  muteUntilSeconds,
   notifyScopeOf,
   peerKey,
   previewText,
@@ -80,6 +82,8 @@ const DAY_MS = 86_400_000;
 const MEMBERS_TTL_MS = 5 * 60_000;
 /** Participants fetched per chat for the @mention picker (GramJS pages 200 at a time). */
 const MEMBERS_LIMIT = 200;
+/** Pinned messages fetched per chat. */
+const PINS_LIMIT = 100;
 const execFileP = promisify(execFile);
 
 // ------------------------------------------------------------------ small utils
@@ -416,7 +420,7 @@ type RawUpdate = { _entities?: Map<string, Entity> };
 export class TelegramAdapter extends Adapter {
   readonly platform = "telegram";
   // "edit" is deliberately absent: the protocol has no edit method yet.
-  readonly capabilities = ["reactions", "reply", "delete", "edit", "typing", "read_receipts", "media_send", "voice", "folders", "mentions", "forward", "search"];
+  readonly capabilities = ["reactions", "reply", "delete", "edit", "typing", "read_receipts", "media_send", "voice", "folders", "mentions", "forward", "search", "mute", "pins"];
 
   private creds?: Creds;
   private client?: TelegramClient;
@@ -453,6 +457,10 @@ export class TelegramAdapter extends Adapter {
   private readonly avatarSlots = new Limiter(4);
   private readonly downloadInflight = new Map<string, Promise<string>>();
   private readonly membersCache = new TtlCache<Member[]>(MEMBERS_TTL_MS);
+  /** chats.pins answers per chat, kept until a pin change (or an edit/delete of a pinned message) drops them. */
+  private readonly pinsCache = new BoundedMap<string, Message[]>(100);
+  /** Bumped by every invalidation, so a fetch that started before one does not cache its stale answer. */
+  private pinsEpoch = 0;
 
   /** Chat folders as last fetched, the JSON last emitted (change detection) and the refetch debounce. */
   private folders: Folder[] = [];
@@ -626,6 +634,8 @@ export class TelegramAdapter extends Adapter {
     this.idToChat.clear();
     this.sentKeys.clear();
     this.membersCache.clear();
+    this.pinsCache.clear();
+    this.pinsEpoch++;
     for (const t of this.typingTimers.values()) clearTimeout(t);
     this.typingTimers.clear();
     this.avatarInflight.clear();
@@ -1728,6 +1738,78 @@ export class TelegramAdapter extends Adapter {
     });
   }
 
+  async muteChat(chatId: string, until: number): Promise<Chat> {
+    const client = this.requireClient();
+    return this.guard(async () => {
+      const peer = await this.inputPeer(chatId);
+      const muteUntil = muteUntilSeconds(until);
+      await client.invoke(
+        new Api.account.UpdateNotifySettings({
+          peer: new Api.InputNotifyPeer({ peer }),
+          settings: new Api.InputPeerNotifySettings({ muteUntil }),
+        }),
+      );
+      // A chat we never listed is read from the server first, which also gives it its notify-scope default.
+      const chat = this.chats.get(chatId) ?? (await this.refreshDialog(chatId, false));
+      if (!chat) throw new BridgeError("not_found", `Unknown chat ${chatId}`);
+      // An explicit 0 (unmute) must win over a muted scope default, so it is stored rather than dropped.
+      this.notifyOwn.set(chatId, new Api.PeerNotifySettings({ muteUntil }));
+      this.applyMute(chat);
+      this.ctx.emit("chat.upsert", { chat });
+      return chat;
+    });
+  }
+
+  /** messages.search with the pinned filter: newest message first, which is the order of Telegram's own pinned bar. */
+  async pinnedMessages(chatId: string): Promise<Message[]> {
+    const client = this.requireClient();
+    return this.guard(async () => {
+      const cached = this.pinsCache.get(chatId);
+      if (cached) return cached;
+      const epoch = this.pinsEpoch;
+      const r = await client.invoke(
+        new Api.messages.Search({
+          peer: await this.inputPeer(chatId),
+          q: "",
+          filter: new Api.InputMessagesFilterPinned(),
+          minDate: 0,
+          maxDate: 0,
+          offsetId: 0,
+          addOffset: 0,
+          limit: PINS_LIMIT,
+          maxId: 0,
+          minId: 0,
+          hash: helpers.returnBigInt(0),
+        }),
+      );
+      const out: Message[] = [];
+      if (!(r instanceof Api.messages.MessagesNotModified)) {
+        for (const e of [...r.users, ...r.chats]) this.rememberEntity(e as Entity);
+        for (const raw of r.messages) {
+          const m = await this.toProtocol(raw as RawMessage);
+          if (!m) continue;
+          this.rememberMessage(m);
+          out.push(m);
+        }
+      }
+      out.sort((a, b) => Number(b.id) - Number(a.id));
+      if (epoch === this.pinsEpoch) this.pinsCache.set(chatId, out);
+      return out;
+    });
+  }
+
+  /** The pinned messages of a chat changed: drop the cached list and tell the app to ask again. */
+  private invalidatePins(chatId: string) {
+    this.pinsEpoch++;
+    this.pinsCache.delete(chatId);
+    this.ctx.emit("pins.update", { chatId });
+  }
+
+  /** An edited or deleted message that is in the cached pin list makes that list stale. */
+  private pinnedMessageChanged(chatId: string, messageId: string) {
+    if (this.pinsCache.get(chatId)?.some((m) => m.id === messageId)) this.invalidatePins(chatId);
+  }
+
   async react(chatId: string, messageId: string, emoji: string): Promise<void> {
     const client = this.requireClient();
     await this.guard(async () => {
@@ -2116,6 +2198,7 @@ export class TelegramAdapter extends Adapter {
   private async processNew(raw: RawMessage) {
     const msg = await this.toProtocol(raw);
     if (!msg) return;
+    if (isPinNotice(raw)) this.invalidatePins(msg.chatId);
     const key = `${msg.chatId}:${msg.id}`;
     const alreadySent = this.sentKeys.has(key); // returned by our own sendMessage
     // Already known from a dialog/list/earlier event: a catch-up replay. It must not bump unread or notify again.
@@ -2243,6 +2326,10 @@ export class TelegramAdapter extends Adapter {
       if (u.peer instanceof Api.DialogPeer) this.onUnreadMark(peerKey(u.peer.peer), !!u.unread);
     } else if (u instanceof Api.UpdateDialogPinned) {
       if (u.peer instanceof Api.DialogPeer) this.onPinChanged(peerKey(u.peer.peer), !!u.pinned);
+    } else if (u instanceof Api.UpdatePinnedMessages) {
+      this.invalidatePins(peerKey(u.peer));
+    } else if (u instanceof Api.UpdatePinnedChannelMessages) {
+      this.invalidatePins(channelKey(u.channelId));
     } else if (u instanceof Api.UpdateFolderPeers) {
       for (const fp of u.folderPeers) this.onArchiveChanged(peerKey(fp.peer), fp.folderId === 1);
     } else if (
@@ -2263,6 +2350,7 @@ export class TelegramAdapter extends Adapter {
     else await this.fillReplies(msg.chatId, [raw], [msg]);
     this.rememberMessage(msg);
     this.ctx.emit("message.update", { message: msg });
+    this.pinnedMessageChanged(msg.chatId, msg.id);
 
     const chat = this.chats.get(msg.chatId);
     if (chat?.lastMessage?.id === msg.id) {
@@ -2280,6 +2368,7 @@ export class TelegramAdapter extends Adapter {
       if (!cid) continue; // never seen this message in this process: cannot attribute it
       this.recent.delete(`${cid}:${id}`);
       this.ctx.emit("message.delete", { chatId: cid, messageId: String(id) });
+      this.pinnedMessageChanged(cid, String(id));
       if (this.chats.get(cid)?.lastMessage?.id === String(id)) refresh.add(cid);
     }
     for (const cid of refresh) {

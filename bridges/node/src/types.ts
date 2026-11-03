@@ -154,6 +154,7 @@ export type EventName =
   | "typing"
   | "presence"
   | "history.phoneSync"
+  | "pins.update"
   | "log";
 
 /** Messages older than this are never "live" (replays, catch-up after a reconnect, backfill). */

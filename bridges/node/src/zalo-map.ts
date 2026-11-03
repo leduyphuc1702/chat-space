@@ -277,6 +277,158 @@ export function quoteToReply(q: any): Message["replyTo"] | undefined {
   };
 }
 
+// ---------------------------------------------------------------- pinned messages
+
+/** Zalo PC's CLI_MSG_TYPE_* (the `msg_type` in a pinned message's params). */
+const PIN_MSG_KIND: Record<number, MessageKind> = {
+  1: "text",
+  31: "voice",
+  32: "image",
+  36: "sticker",
+  37: "image", // doodle
+  38: "contact",
+  40: "link",
+  43: "location",
+  44: "video",
+  46: "file",
+  49: "gif",
+};
+
+/** Topic type of a pinned message (zca-js GroupTopicType.Message); notes are 0, links 1, polls 3. */
+const TOPIC_MESSAGE = 2;
+
+export interface PinTopic {
+  /** Board topic id (what the unpin / reorder events refer to). */
+  id: string;
+  /** Global msgId of the pinned message; "" when Zalo sent none. Same as `Message.id` when the message is stored. */
+  msgId: string;
+  cliMsgId: string;
+  /** Sender uid; "0" is the account owner, "" unknown. */
+  senderUid: string;
+  senderName?: string;
+  /** ms epoch the topic was created, 0 if unknown. The original message's time is not part of a pin. */
+  pinnedAt: number;
+  mapped: Mapped;
+}
+
+/**
+ * A pinned-message topic as Zalo PC stores it: the entries of `board/list` (boardType 2) and `friendboard/list`, and
+ * `topic` of the group / friend pin events. `params` and its `extra` are JSON strings on the wire, objects once parsed.
+ * Params written by Zalo PC (getTopicDataFromMessage): `client_msg_id`, `global_msg_id`, `senderUid`, `senderName`,
+ * `msg_type`, and per type `title` (text / caption / file name / location), `thumb`, `href`, `extra`
+ * (file: fileSize, fileExt, ...; sticker: id, catId; contact: action).
+ * Returns undefined for anything that is not a pinned message (notes, polls) or names no message.
+ */
+export function parsePinTopic(raw: unknown): PinTopic | undefined {
+  const t = parseParams(raw);
+  if (t.type !== undefined && Number(t.type) !== TOPIC_MESSAGE) return undefined;
+  const p = parseParams(t.params);
+  const realId = (x: unknown) => {
+    const s = str(x);
+    return s === "0" ? "" : s;
+  };
+  const msgId = realId(p.global_msg_id);
+  const cliMsgId = realId(p.client_msg_id);
+  if (!msgId && !cliMsgId) return undefined;
+
+  const msgType = num(p.msg_type);
+  const extra = parseParams(p.extra);
+  const title = nonEmpty(p.title);
+  const thumb = nonEmpty(p.thumb);
+  const href = nonEmpty(p.href);
+  let kind: MessageKind = (msgType !== undefined && PIN_MSG_KIND[msgType]) || "unsupported";
+  if (kind === "contact" && /link/i.test(str(extra.action))) kind = "link";
+
+  let mapped: Mapped;
+  switch (kind) {
+    case "image":
+      mapped = { kind, text: title, media: thumb ? { url: thumb, thumbnail: thumb, mime: mimeFromName(thumb) ?? "image/jpeg" } : undefined };
+      break;
+    case "gif":
+      mapped = { kind, media: thumb ? { url: thumb, thumbnail: thumb, mime: "image/gif" } : undefined };
+      break;
+    case "video":
+      mapped = { kind, text: title, media: thumb ? { thumbnail: thumb, mime: "video/mp4" } : undefined };
+      break;
+    case "file": {
+      const fileName = title ?? "file";
+      mapped = { kind, text: fileName, media: { fileName, mime: mimeFromName(fileName), size: num(extra.fileSize) } };
+      break;
+    }
+    case "sticker": {
+      const id = num(extra.id);
+      mapped = {
+        kind,
+        text: id === undefined ? "[Sticker]" : undefined,
+        media: thumb ? { url: thumb } : undefined,
+        sticker: id === undefined ? undefined : { id, cateId: num(extra.catId) ?? num(extra.cateId) ?? 0 },
+      };
+      break;
+    }
+    case "location":
+      mapped = { kind, text: title ?? "[Vị trí]" };
+      break;
+    case "link": {
+      const parts: string[] = [];
+      for (const s of [title, href]) if (s && !parts.includes(s)) parts.push(s);
+      mapped = { kind, text: parts.join("\n") || undefined, media: { url: href, thumbnail: thumb } };
+      break;
+    }
+    case "contact":
+      mapped = { kind, text: title ?? "[Danh thiếp]", media: { url: href, thumbnail: thumb } };
+      break;
+    case "voice":
+      mapped = { kind };
+      break;
+    case "text":
+      mapped = { kind, text: title };
+      break;
+    default:
+      mapped = { kind: "unsupported", text: title };
+  }
+
+  const created = num(t.createTime);
+  return {
+    id: str(t.id),
+    msgId,
+    cliMsgId,
+    senderUid: str(p.senderUid),
+    senderName: nonEmpty(p.senderName),
+    pinnedAt: created ? toMs(created) : 0,
+    mapped,
+  };
+}
+
+/** Pinned-message topics out of a board list (anything else in it is skipped), most recently pinned first. */
+export function parsePinTopics(items: unknown[]): PinTopic[] {
+  const pins: PinTopic[] = [];
+  for (const raw of items) {
+    const pin = parsePinTopic(raw);
+    if (pin) pins.push(pin);
+  }
+  return pins.sort((a, b) => b.pinnedAt - a.pinnedAt); // stable: equal times keep Zalo's order
+}
+
+/**
+ * Message for a pin whose original is not stored. Sticker media and the sender's contact name are for the caller to
+ * fill in; `timestamp` is the pin time (Zalo gives no other).
+ */
+export function pinToMessage(pin: PinTopic, chatId: string, selfId: string, now = Date.now()): Message {
+  const senderId = pin.senderUid === "0" ? selfId : pin.senderUid;
+  const { kind, text, media } = pin.mapped;
+  return {
+    id: pin.msgId || pin.cliMsgId,
+    chatId,
+    senderId,
+    senderName: pin.senderName,
+    fromMe: !!senderId && senderId === selfId,
+    timestamp: pin.pinnedAt || now,
+    kind,
+    text,
+    media,
+  };
+}
+
 // ---------------------------------------------------------------- reactions
 
 /** Zalo reaction code -> emoji. Codes missing here are shown as the raw code. */

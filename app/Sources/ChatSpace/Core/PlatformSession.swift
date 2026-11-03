@@ -59,6 +59,9 @@ final class PlatformSession {
     var phoneSync: PhoneSyncProgress?
     /// In-chat search jumps here (message id per chat).
     var scrollTarget: [String: String] = [:]
+    /// Pinned messages per chat (chats.pins), most recently pinned first; absent until the chat is opened.
+    var pins: [String: [Message]] = [:]
+    @ObservationIgnored private var loadingPins: Set<String> = []
 
     @ObservationIgnored private var bridge: BridgeProcess?
     @ObservationIgnored private var avatarRequested: Set<String> = []
@@ -332,6 +335,9 @@ final class PlatformSession {
             let r = try await call("chats.list", ["limit": 200])
             chats = sorted(try r["chats"]?.decode([Chat].self) ?? [])
             Notifier.shared.reconcile(platform: platform, unread: Set(chats.filter(\.hasUnread).map(\.id)))
+            // Pins may have changed while the bridge was away; other chats reload them when reopened.
+            pins = pins.filter { $0.key == selectedChatId }
+            if let id = selectedChatId { loadPins(id, force: true) }
         } catch {
             bridgeError = error.localizedDescription
         }
@@ -391,7 +397,57 @@ final class PlatformSession {
     func prepare(_ chatId: String) {
         trimMessages(except: chatId)
         if messages[chatId] == nil { Task { await loadMessages(chatId) } }
+        loadPins(chatId)
         markRead(chatId)
+    }
+
+    // MARK: Pins & mute
+
+    /// Asks the bridge once per chat; `pins.update` refreshes chats already loaded.
+    func loadPins(_ chatId: String, force: Bool = false) {
+        guard can("pins"), force || pins[chatId] == nil, !loadingPins.contains(chatId) else { return }
+        if DemoData.enabled {
+            pins[chatId] = DemoData.pins(chatId, in: self)
+            return
+        }
+        loadingPins.insert(chatId)
+        Task {
+            defer { loadingPins.remove(chatId) }
+            guard let r = try? await call("chats.pins", ["chatId": .string(chatId)]),
+                  let list = try? r["messages"]?.decode([Message].self) else { return }
+            pins[chatId] = list
+        }
+    }
+
+    /// A pin as currently loaded in the chat (edits and recalls show), else as the bridge reported it.
+    func pinned(_ chatId: String) -> [Message] {
+        (pins[chatId] ?? []).map { p in messages[chatId]?.first { $0.id == p.id } ?? p }
+    }
+
+    /// Mutes the chat on the platform itself until `until` (ms epoch), forever (-1), or unmutes it (0).
+    /// Shown at once; put back with an alert if the platform refuses.
+    func setMute(_ chatId: String, until: Double) {
+        guard let i = chats.firstIndex(where: { $0.id == chatId }) else { return }
+        let before = chats[i]
+        chats[i].muted = until != 0
+        chats[i].mutedUntil = until == 0 ? nil : until
+        if until != 0 { Notifier.shared.clear(platform: platform, chatId: chatId) }
+        if DemoData.enabled { return }
+        Task {
+            do {
+                let r = try await call("chats.mute", ["chatId": .string(chatId), "until": .number(until)])
+                if let c = try? r["chat"]?.decode(Chat.self) { upsertChat(c) }
+            } catch {
+                if let j = chats.firstIndex(where: { $0.id == chatId }) {
+                    chats[j].muted = before.muted
+                    chats[j].mutedUntil = before.mutedUntil
+                }
+                let alert = NSAlert()
+                alert.messageText = until == 0 ? "Không bật được thông báo" : "Không tắt được thông báo"
+                alert.informativeText = "\(before.title) (\(platform.displayName)): \(error.localizedDescription)"
+                alert.runModal()
+            }
+        }
     }
 
     private static let keptPerChat = 50
@@ -473,14 +529,14 @@ final class PlatformSession {
     /// Opens the history of `m`'s chat far enough back to contain it, then scrolls there and highlights it.
     /// Returns false when the message could not be reached (deleted, or too far back).
     @discardableResult
-    func reveal(_ m: Message) async -> Bool {
+    func reveal(_ m: Message, maxPages: Int = 60) async -> Bool {
         let chatId = m.chatId
         revealing = chatId
         defer { if revealing == chatId { revealing = nil } }
         if messages[chatId] == nil { await loadMessages(chatId) }
         func loaded() -> Bool { messages[chatId]?.contains { $0.id == m.id } ?? false }
         var pages = 0
-        while !loaded(), pages < 60 {
+        while !loaded(), pages < maxPages {
             while loadingHistory.contains(chatId) { try? await Task.sleep(nanoseconds: 50_000_000) }
             if let first = messages[chatId]?.first, first.timestamp < m.timestamp - 1 { break }
             guard await fetchOlder(chatId, limit: 100) else { break }
@@ -1083,6 +1139,8 @@ final class PlatformSession {
             }
         case "history.phoneSync":
             if let p = try? data.decode(PhoneSyncProgress.self) { applyPhoneSync(p) }
+        case "pins.update":
+            if let c = data["chatId"]?.stringValue, pins[c] != nil { loadPins(c, force: true) }
         case "presence":
             if let c = data["chatId"]?.stringValue, let i = chats.firstIndex(where: { $0.id == c }) {
                 chats[i].online = data["online"]?.boolValue

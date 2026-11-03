@@ -370,6 +370,7 @@ struct ChatMenuItems: View {
         if chat.hasUnread {
             Button("Đánh dấu đã đọc") { session.markRead(chat.id) }
         }
+        MuteMenuItems(session: session, chat: chat)
         Divider()
         if ws.isIgnored(ref) {
             Button("Hiện lại trong mục Chưa đọc của ChatSpace") { ws.restore(ref) }

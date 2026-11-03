@@ -11,6 +11,7 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -90,6 +91,7 @@ func (b *bridge) ingestTable(tbl *table.LSTable, mode ingestMode) {
 	x.threads(tbl)
 	x.participants(tbl)
 	x.messages(tbl)
+	x.pins(tbl)
 	x.updates(tbl)
 	x.flush()
 }
@@ -529,6 +531,57 @@ func previewText(m Message) string {
 		return "Location"
 	}
 	return ""
+}
+
+// Pins -----------------------------------------------------------------------
+
+// pins keeps the pinned messages of each thread from the only two tables Meta sends
+// for them with thread sync: LSSetPinnedMessage and LSClearPinnedMessages (delete by
+// thread key). A table keeps no order between the two, so clears run first: a clear
+// plus sets for one thread replaces its pins. No pin is made at time 0, so a set
+// without a timestamp is read as an unpin of that message (and could not be ordered
+// anyway). pins.update goes out only for threads whose list really changed, so a
+// sync that repeats the current state stays silent.
+func (x *batch) pins(tbl *table.LSTable) {
+	if len(tbl.LSClearPinnedMessages) == 0 && len(tbl.LSSetPinnedMessage) == 0 {
+		return
+	}
+	before := map[string][]pinRec{}
+	var order []string
+	// Pins of the pre-encryption thread of an encrypted 1:1 chat belong to the encrypted
+	// chat, where its messages are filed (openChat).
+	chatOf := func(key int64) string {
+		chat, open := x.openChat(key)
+		if !open {
+			chat = chatKey(key)
+		}
+		if _, seen := before[chat]; !seen {
+			before[chat] = x.b.st.pinList(chat)
+			order = append(order, chat)
+		}
+		return chat
+	}
+	for _, c := range tbl.LSClearPinnedMessages {
+		if c.ThreadKey != 0 {
+			x.b.st.clearPins(chatOf(c.ThreadKey))
+		}
+	}
+	for _, p := range tbl.LSSetPinnedMessage {
+		if p.ThreadKey == 0 || p.MessageId == "" {
+			continue
+		}
+		chat := chatOf(p.ThreadKey)
+		if p.PinnedTimestampMs <= 0 {
+			x.b.st.removePin(chat, p.MessageId)
+		} else {
+			x.b.st.setPin(chat, p.MessageId, p.PinnedTimestampMs)
+		}
+	}
+	for _, chat := range order {
+		if !slices.Equal(before[chat], x.b.st.pinList(chat)) {
+			x.msgEv = append(x.msgEv, eventFrame{Event: "pins.update", Data: map[string]any{"chatId": chat}})
+		}
+	}
 }
 
 // Message conversion ----------------------------------------------------------

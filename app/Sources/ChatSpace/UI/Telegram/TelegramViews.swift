@@ -338,6 +338,7 @@ struct TelegramConversation: View {
         VStack(spacing: 0) {
             header
             Rectangle().fill(TG.separator).frame(height: 1)
+            PinnedBar(session: session, chat: chat)
             ZStack {
                 TelegramWallpaper()
                 ChatScroll(session: session, chatId: chat.id, spacing: 0,

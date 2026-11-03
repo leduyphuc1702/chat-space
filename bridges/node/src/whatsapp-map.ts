@@ -2,7 +2,7 @@
 import { extractMessageContent, getContentType, isPnUser, jidDecode, proto } from "baileys";
 import { existsSync } from "node:fs";
 import type { Media, Message, MessageKind, Reaction } from "./types.ts";
-import { num, type StoredMsg } from "./whatsapp-store.ts";
+import { num, type PinEvent, type StoredMsg } from "./whatsapp-store.ts";
 
 export interface MapCtx {
   selfId: string;
@@ -383,10 +383,55 @@ const STORABLE_STUBS = new Set<number>([
   Stub.CALL_MISSED_GROUP_VIDEO,
 ]);
 
+const PinType = proto.Message.PinInChatMessage.Type;
+/** The app offers 24 h / 7 d / 30 d; a pin that does not say how long it lasts gets WhatsApp's default (7 d). */
+const DEFAULT_PIN_SECS = 7 * 86400;
+
+/** The pinInChatMessage of a message (also inside the device-sent wrapper of history) and the context info with its duration. */
+function pinMessage(raw: any): { pin?: any; info?: any } {
+  const outer: any = extractMessageContent(raw.message);
+  const inner: any = outer?.deviceSentMessage?.message ? extractMessageContent(outer.deviceSentMessage.message) : outer;
+  if (!inner?.pinInChatMessage) return {};
+  return { pin: inner.pinInChatMessage, info: inner.messageContextInfo ?? outer.messageContextInfo ?? raw.message?.messageContextInfo };
+}
+
+/**
+ * A pin or unpin carried by a message: either a pinInChatMessage (live and offline messages; its duration is in
+ * messageContextInfo) or the `pinInChat` WhatsApp attaches to the pinned message itself (history sync).
+ */
+export function pinEvent(raw: any): PinEvent | null {
+  const { pin: pm, info } = pinMessage(raw);
+  const sent = num(raw.messageTimestamp) * 1000;
+  let id: string | undefined;
+  let type: number;
+  let at: number;
+  let secs: number;
+  if (pm) {
+    id = pm.key?.id;
+    type = num(pm.type);
+    at = num(pm.senderTimestampMs) || sent;
+    secs = num(info?.messageAddOnDurationInSecs);
+  } else if (raw.pinInChat) {
+    const p = raw.pinInChat;
+    id = p.key?.id || raw.key?.id;
+    type = num(p.type);
+    at = num(p.senderTimestampMs) || num(p.serverTimestampMs) || sent;
+    secs = num(p.messageAddOnContextInfo?.messageAddOnDurationInSecs);
+  } else {
+    return null;
+  }
+  if (!id || (type !== PinType.PIN_FOR_ALL && type !== PinType.UNPIN_FOR_ALL)) return null;
+  at ||= Date.now();
+  const pin = type === PinType.PIN_FOR_ALL;
+  return { id, pin, at, expiresAt: pin ? at + (secs > 0 ? secs : DEFAULT_PIN_SECS) * 1000 : 0 };
+}
+
 /** Cheap pre-check used at ingestion: would this message ever be user-visible? */
 export function isStorable(raw: any): boolean {
   const content = extractMessageContent(raw.message);
   if (content) {
+    // A pin shows as a system line; an unpin leaves nothing in the chat.
+    if (pinMessage(raw).pin) return !!pinEvent(raw)?.pin;
     const t = getContentType(content);
     return !!t && !HIDDEN.has(t);
   }
@@ -421,6 +466,11 @@ export function mapMessage(sm: StoredMsg, chatId: string, ctx: MapCtx): Message 
   if (!content) {
     const stub = raw.messageStubType ? stubOf(raw, chatId, ctx) : null;
     return stub ? { ...base, kind: stub.kind, text: stub.text } : null;
+  }
+
+  if (pinMessage(raw).pin) {
+    if (!pinEvent(raw)?.pin) return null;
+    return { ...base, kind: "system", text: `${fromMe ? "You" : base.senderName ?? fallbackName(senderId)} pinned a message` };
   }
 
   const d = decode(content);

@@ -106,6 +106,14 @@ const handlers: Record<string, (p: Params) => Promise<unknown>> = {
     await adapter.markRead(need(p, "chatId"));
     return {};
   },
+  "chats.mute": async (p) => {
+    const until = Number(p.until);
+    if (!Number.isFinite(until) || (until < 0 && until !== -1)) {
+      throw new BridgeError("invalid_params", "until must be a ms timestamp, -1 (forever) or 0 (unmute)");
+    }
+    return { chat: await adapter.muteChat(need(p, "chatId"), until) };
+  },
+  "chats.pins": async (p) => ({ messages: await adapter.pinnedMessages(need(p, "chatId")) }),
   "messages.react": async (p) => {
     await adapter.react(need(p, "chatId"), need(p, "messageId"), p.emoji ?? "");
     return {};

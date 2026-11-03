@@ -76,6 +76,12 @@ type storedMsg struct {
 	WAReplyTo string            `json:"waReplyTo,omitempty"`
 }
 
+// pinRec is one pinned message of a thread (LSSetPinnedMessage).
+type pinRec struct {
+	ID string `json:"id"`
+	At int64  `json:"at"` // PinnedTimestampMs
+}
+
 type storeFile struct {
 	Version  int                     `json:"version"`
 	Threads  []*threadRec            `json:"threads"`
@@ -84,6 +90,9 @@ type storeFile struct {
 	// Members: group chat id -> participant Facebook user ids (LSAddParticipantIdToGroupThread).
 	// Absent in stores written before @mentions existed; it simply fills up on the next sync.
 	Members map[string][]string `json:"members,omitempty"`
+	// Pins: chat id -> pinned messages, newest pin first. Absent in stores written before
+	// pinned messages existed; it fills up as Meta sends pins with thread sync.
+	Pins map[string][]pinRec `json:"pins,omitempty"`
 }
 
 type store struct {
@@ -94,6 +103,7 @@ type store struct {
 	threads  map[string]*threadRec
 	contacts map[string]*contactRec
 	members  map[string]map[string]struct{} // chat id -> participant user ids
+	pins     map[string][]pinRec            // chat id -> pinned messages, newest pin first
 	msgs     map[string][]*storedMsg
 	msgChat  map[string]string // message id -> chat id
 	jidChat  map[string]string // E2EE JID user -> chat id
@@ -113,6 +123,7 @@ func (s *store) resetLocked() {
 	s.threads = map[string]*threadRec{}
 	s.contacts = map[string]*contactRec{}
 	s.members = map[string]map[string]struct{}{}
+	s.pins = map[string][]pinRec{}
 	s.msgs = map[string][]*storedMsg{}
 	s.msgChat = map[string]string{}
 	s.jidChat = map[string]string{}
@@ -150,6 +161,11 @@ func (s *store) load() error {
 			set[id] = struct{}{}
 		}
 		s.members[chat] = set
+	}
+	for chat, list := range f.Pins {
+		if len(list) > 0 {
+			s.pins[chat] = list
+		}
 	}
 	for chat, list := range f.Messages {
 		for _, m := range list {
@@ -211,6 +227,12 @@ func (s *store) flush() error {
 		f.Members = make(map[string][]string, len(s.members))
 		for chat, set := range s.members {
 			f.Members[chat] = sortedKeys(set)
+		}
+	}
+	if len(s.pins) > 0 {
+		f.Pins = make(map[string][]pinRec, len(s.pins))
+		for chat, list := range s.pins {
+			f.Pins[chat] = list
 		}
 	}
 	for chat, list := range s.msgs {
@@ -283,6 +305,7 @@ func (s *store) removeThread(id string) {
 	delete(s.msgs, id)
 	delete(s.threads, id)
 	delete(s.members, id)
+	delete(s.pins, id)
 	delete(s.deep, id)
 	for user, chat := range s.jidChat {
 		if chat == id {
@@ -388,6 +411,50 @@ func (s *store) memberIDs(chat string) []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return sortedKeys(s.members[chat])
+}
+
+// Pins ----------------------------------------------------------------------
+
+// pinList returns the pins of a chat, newest pin first.
+func (s *store) pinList(chat string) []pinRec {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return slices.Clone(s.pins[chat])
+}
+
+// setPin records a pin, or moves an existing one to its new time.
+func (s *store) setPin(chat, id string, at int64) {
+	s.mu.Lock()
+	list := slices.DeleteFunc(slices.Clone(s.pins[chat]), func(p pinRec) bool { return p.ID == id })
+	list = append(list, pinRec{ID: id, At: at})
+	sort.Slice(list, func(i, j int) bool {
+		if list[i].At != list[j].At {
+			return list[i].At > list[j].At
+		}
+		return list[i].ID > list[j].ID
+	})
+	s.pins[chat] = list
+	s.mu.Unlock()
+	s.markDirty()
+}
+
+func (s *store) removePin(chat, id string) {
+	s.mu.Lock()
+	list := slices.DeleteFunc(slices.Clone(s.pins[chat]), func(p pinRec) bool { return p.ID == id })
+	if len(list) == 0 {
+		delete(s.pins, chat)
+	} else {
+		s.pins[chat] = list
+	}
+	s.mu.Unlock()
+	s.markDirty()
+}
+
+func (s *store) clearPins(chat string) {
+	s.mu.Lock()
+	delete(s.pins, chat)
+	s.mu.Unlock()
+	s.markDirty()
 }
 
 // Contacts ------------------------------------------------------------------

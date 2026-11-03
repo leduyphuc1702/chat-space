@@ -49,6 +49,21 @@ export function num(v: any): number {
   return 0;
 }
 
+/**
+ * Mute end as WhatsApp reports it -> ms epoch; -1 = forever, 0 = not muted. History chunks carry seconds, app-state
+ * patches ms; a negative value (how "Always" is sent) or a date centuries away means forever.
+ */
+export function muteEndMs(v: unknown): number {
+  const n = v == null ? 0 : num(v);
+  const ms = n < 0 ? -1 : n === 0 ? 0 : n > 1e12 ? n : n * 1000;
+  return ms > 4e12 ? -1 : ms;
+}
+
+/** chats.mute `until` (ms epoch, -1 forever, 0 unmute) -> the value of chatModify({ mute }); null unmutes. */
+export function muteArg(until: number): number | null {
+  return until === 0 ? null : until < 0 ? -1 : Math.floor(until);
+}
+
 /** `user:device@server` -> `user@server`; legacy c.us -> s.whatsapp.net. Never throws. */
 export function normJid(jid?: string | null): string {
   if (!jid) return "";
@@ -71,6 +86,37 @@ export interface StoredChat {
   /** ms epoch of last activity */
   timestamp: number;
 }
+
+/** WhatsApp lets a chat have this many pinned messages. */
+export const MAX_PINS = 3;
+/** Longest pin duration WhatsApp offers (30 days): an older pin event can no longer be live. */
+const MAX_PIN_MS = 30 * 86400_000;
+const MAX_DEAD_PINS = 20;
+
+/** A pin or unpin of one message, as carried by a pinInChatMessage. */
+export interface PinEvent {
+  /** id of the pinned message */
+  id: string;
+  pin: boolean;
+  /** ms the pin/unpin was made */
+  at: number;
+  /** ms the pin lapses (pins only) */
+  expiresAt: number;
+}
+
+/**
+ * The newest event about one message. `unpinned` records stay (as do lapsed pins) so an older event for the same
+ * message arriving later, which history sync does (newest first), cannot bring the pin back.
+ */
+export interface StoredPin {
+  id: string;
+  pinnedAt: number;
+  expiresAt: number;
+  unpinned?: true;
+}
+
+const pinLive = (p: StoredPin, now: number) => !p.unpinned && p.expiresAt > now;
+const activeOf = (list: StoredPin[], now: number) => list.filter((p) => pinLive(p, now)).sort((a, b) => b.pinnedAt - a.pinnedAt);
 
 export interface StoredContact {
   id: string;
@@ -103,6 +149,8 @@ export class WAStore {
   contacts = new Map<string, StoredContact>();
   lid2pn = new Map<string, string>();
   groups = new Map<string, GroupInfo>();
+  /** pin records per chat (see StoredPin); persisted in the index */
+  pins = new Map<string, StoredPin[]>();
   accountId?: string;
   accountName?: string;
   /** Fired when two chats of the same person were merged (LID chat folded into PN chat). */
@@ -148,6 +196,7 @@ export class WAStore {
         for (const c of j.contacts ?? []) this.contacts.set(c.id, c);
         for (const [l, p] of j.lid2pn ?? []) this.lid2pn.set(l, p);
         for (const [id, g] of j.groups ?? []) this.groups.set(id, g);
+        for (const [id, list] of j.pins ?? []) this.pins.set(id, list);
         if (file === this.indexPath) this.dirtyIndex = true; // legacy plain file: rewrite it compressed
         break;
       } catch (e) {
@@ -299,6 +348,7 @@ export class WAStore {
         contacts: [...this.contacts.values()],
         lid2pn: [...this.lid2pn],
         groups: [...this.groups],
+        pins: [...this.pins],
       });
     }
     return { files, removed, index };
@@ -354,6 +404,7 @@ export class WAStore {
     this.contacts.clear();
     this.lid2pn.clear();
     this.groups.clear();
+    this.pins.clear();
     this.msgs.clear();
     this.idx.clear();
     this.capFor.clear();
@@ -427,6 +478,12 @@ export class WAStore {
       this.markChatDirty(to);
       changed = true;
     }
+    const pa = this.pins.get(from);
+    if (pa) {
+      this.pins.delete(from);
+      for (const p of pa) this.applyPin(to, { id: p.id, pin: !p.unpinned, at: p.pinnedAt, expiresAt: p.expiresAt });
+      changed = true;
+    }
     const ca = this.contacts.get(from);
     if (ca) {
       const cb = this.contacts.get(to) ?? { id: to };
@@ -466,6 +523,7 @@ export class WAStore {
 
   deleteChat(id: string) {
     if (this.chats.delete(id)) this.markIndexDirty();
+    if (this.pins.delete(id)) this.markIndexDirty();
     if (this.msgs.delete(id)) {
       this.idx.delete(id);
       this.unsorted.delete(id);
@@ -496,6 +554,55 @@ export class WAStore {
   contactName(jid: string): string | undefined {
     const c = this.contacts.get(this.canon(jid));
     return c?.name || c?.notify || c?.verifiedName || undefined;
+  }
+
+  // ---------------------------------------------------------------- pins
+
+  /** Pins of a chat that have not lapsed, most recently pinned first. */
+  activePins(chatId: string, now = Date.now()): StoredPin[] {
+    return activeOf(this.pins.get(chatId) ?? [], now);
+  }
+
+  /**
+   * Record a pin/unpin. The newest event about a message wins, whatever order they arrive in; a pin beyond MAX_PINS
+   * pushes the oldest one out. Returns true when the chat's active pins changed.
+   */
+  applyPin(chatId: string, e: PinEvent, now = Date.now()): boolean {
+    const list = this.pins.get(chatId) ?? [];
+    const cur = list.find((p) => p.id === e.id);
+    if (cur && cur.pinnedAt >= e.at) return false;
+    const key = (l: StoredPin[]) => activeOf(l, now).map((p) => `${p.id}@${p.pinnedAt}`).join();
+    const before = key(list);
+    const next = list.filter((p) => p !== cur);
+    next.push(e.pin ? { id: e.id, pinnedAt: e.at, expiresAt: e.expiresAt } : { id: e.id, pinnedAt: e.at, expiresAt: 0, unpinned: true });
+    for (const p of activeOf(next, now).slice(MAX_PINS)) p.unpinned = true;
+    // Dead records only matter while an older event could still be live.
+    const dead = next
+      .filter((p) => !pinLive(p, now) && p.pinnedAt > now - MAX_PIN_MS)
+      .sort((a, b) => b.pinnedAt - a.pinnedAt)
+      .slice(0, MAX_DEAD_PINS);
+    const kept = [...next.filter((p) => pinLive(p, now)), ...dead];
+    this.pins.set(chatId, kept);
+    this.markIndexDirty();
+    return key(kept) !== before;
+  }
+
+  /** Earliest moment an active pin lapses; undefined when there is none. */
+  nextPinExpiry(now = Date.now()): number | undefined {
+    let at: number | undefined;
+    for (const list of this.pins.values()) {
+      for (const p of list) if (pinLive(p, now) && (at === undefined || p.expiresAt < at)) at = p.expiresAt;
+    }
+    return at;
+  }
+
+  /** Chats where a pin lapsed after `since` and up to `now`. */
+  lapsedPinChats(since: number, now = Date.now()): string[] {
+    const out: string[] = [];
+    for (const [chatId, list] of this.pins) {
+      if (list.some((p) => !p.unpinned && p.expiresAt > since && p.expiresAt <= now)) out.push(chatId);
+    }
+    return out;
   }
 
   // ---------------------------------------------------------------- messages

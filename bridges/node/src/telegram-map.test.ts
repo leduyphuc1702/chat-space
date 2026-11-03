@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { Api } from "telegram";
-import { mapReactions, normalizeReactionEmoji, reactionEmoticonForTelegram } from "./telegram-map.ts";
+import { isPinNotice, mapReactions, muteInfo, muteUntilSeconds, normalizeReactionEmoji, reactionEmoticonForTelegram } from "./telegram-map.ts";
 
 const VS16 = "\uFE0F";
 
@@ -47,5 +47,40 @@ describe("mapReactions", () => {
       { emoji: "\u2764" + VS16, count: 2, fromMe: true },
       { emoji: "\u{1F44D}", count: 1, fromMe: false },
     ]);
+  });
+});
+
+describe("muteUntilSeconds", () => {
+  const FOREVER = 2 ** 31 - 1;
+  test("unmute is 0 and forever is 2^31-1", () => {
+    expect(muteUntilSeconds(0)).toBe(0);
+    expect(muteUntilSeconds(-1)).toBe(FOREVER);
+  });
+  test("a ms epoch becomes whole seconds, rounded up, and never passes 2^31-1", () => {
+    expect(muteUntilSeconds(1_800_000_000_000)).toBe(1_800_000_000);
+    expect(muteUntilSeconds(1_800_000_000_001)).toBe(1_800_000_001);
+    expect(muteUntilSeconds(9_999_999_999_999)).toBe(FOREVER);
+  });
+  test("round-trips through muteInfo", () => {
+    const own = (muteUntil: number) => new Api.PeerNotifySettings({ muteUntil });
+    const soon = Math.ceil((Date.now() + 3_600_000) / 1000) * 1000;
+    expect(muteInfo(own(muteUntilSeconds(-1)))).toEqual({ muted: true, mutedUntil: -1 });
+    expect(muteInfo(own(muteUntilSeconds(soon)))).toEqual({ muted: true, mutedUntil: soon });
+    expect(muteInfo(own(muteUntilSeconds(0)))).toEqual({ muted: false });
+  });
+  test("an explicit unmute beats a muted scope default", () => {
+    const scope = new Api.PeerNotifySettings({ muteUntil: muteUntilSeconds(-1) });
+    expect(muteInfo(undefined, scope).muted).toBe(true);
+    expect(muteInfo(new Api.PeerNotifySettings({ muteUntil: 0 }), scope)).toEqual({ muted: false });
+  });
+});
+
+describe("isPinNotice", () => {
+  const svc = (action: Api.TypeMessageAction) =>
+    new Api.MessageService({ id: 7, peerId: new Api.PeerUser({ userId: BigInt(1) as never }), date: 1, action });
+  test("only the pin service line counts", () => {
+    expect(isPinNotice(svc(new Api.MessageActionPinMessage()))).toBe(true);
+    expect(isPinNotice(svc(new Api.MessageActionChatDeletePhoto()))).toBe(false);
+    expect(isPinNotice(new Api.MessageEmpty({ id: 7 }))).toBe(false);
   });
 });

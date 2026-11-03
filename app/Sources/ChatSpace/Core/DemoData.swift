@@ -86,7 +86,7 @@ enum DemoData {
     static func load(into s: PlatformSession) {
         let now = Date().timeIntervalSince1970 * 1000
         let min = 60_000.0
-        s.capabilities = ["reactions", "reply", "delete", "typing", "read_receipts", "media_send", "mentions", "edit"]
+        s.capabilities = ["reactions", "reply", "delete", "typing", "read_receipts", "media_send", "mentions", "edit", "mute", "pins"]
         if s.platform == .whatsapp || s.platform == .telegram { s.capabilities.insert("forward") }
         s.selfInfo = SelfInfo(id: "me", name: "Minh")
         s.connection = "online"
@@ -204,6 +204,7 @@ enum DemoData {
         s.selectedChatId = ProcessInfo.processInfo.environment["CHATSPACE_DEMO_EMPTY"] != nil ? nil
             : (s.platform == .telegram || s.platform == .whatsapp ? group : direct)
         s.typing = s.platform == .zalo ? ["c3": [TypingInfo(userId: "u4", name: "Hoàng Long")]] : [:]
+        if let id = s.selectedChatId { s.loadPins(id) }
         s.authState = .loggedIn
         if let delay = ProcessInfo.processInfo.environment["CHATSPACE_DEMO_NOTIFY"].flatMap(Double.init),
            s.platform == ProcessInfo.processInfo.environment["CHATSPACE_DEMO_NOTIFY_PLATFORM"].flatMap(Platform.init(rawValue:)) ?? .whatsapp {
@@ -268,6 +269,13 @@ enum DemoData {
             s.authStep = step
             s.authState = .awaitingInput
         }
+    }
+
+    /// "Team Thiết Kế" has two pins (the meeting place, then the time), "Lan Anh" the design file.
+    @MainActor
+    static func pins(_ chatId: String, in s: PlatformSession) -> [Message] {
+        let ids = ["c2": ["g5", "g3"], "c1": ["m6"]][chatId] ?? []
+        return ids.compactMap { id in s.messages[chatId]?.first { $0.id == id } }
     }
 
     static func members(_ chatId: String) -> [ChatMember] {

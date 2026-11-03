@@ -363,6 +363,7 @@ struct MessengerConversation: View {
     var body: some View {
         VStack(spacing: 0) {
             header
+            PinnedBar(session: session, chat: chat)
             ChatScroll(session: session, chatId: chat.id, spacing: 0,
                        padding: EdgeInsets(top: 12, leading: 0, bottom: 8, trailing: 0)) { rows in
                 if session.reachedStart.contains(chat.id) { intro }

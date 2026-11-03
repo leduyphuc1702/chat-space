@@ -510,6 +510,7 @@ struct ZaloConversation: View {
     var body: some View {
         VStack(spacing: 0) {
             header
+            PinnedBar(session: session, chat: chat)
             ZStack {
                 ZL.chatBackground
                 ChatScroll(session: session, chatId: chat.id, spacing: 0,

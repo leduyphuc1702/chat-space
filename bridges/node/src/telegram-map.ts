@@ -70,6 +70,7 @@ export function userPresence(
 }
 
 const FIVE_YEARS_MS = 5 * 365 * 86_400_000;
+const FOREVER_S = 2 ** 31 - 1;
 
 /**
  * Mute state from Telegram's notify settings. `muteUntil` is in seconds; official clients store "forever" as
@@ -87,6 +88,13 @@ export function muteInfo(
   const ms = until * 1000;
   if (ms <= Date.now()) return { muted: false };
   return { muted: true, mutedUntil: ms - Date.now() > FIVE_YEARS_MS ? -1 : ms };
+}
+
+/** `muteUntil` (seconds) for the protocol's `until`: ms epoch, -1 = forever, 0 = unmute. */
+export function muteUntilSeconds(untilMs: number): number {
+  if (untilMs === 0) return 0;
+  if (untilMs < 0) return FOREVER_S;
+  return Math.min(Math.ceil(untilMs / 1000), FOREVER_S);
 }
 
 export function isMuted(ns?: Api.TypePeerNotifySettings): boolean {
@@ -434,6 +442,11 @@ function serviceText(a: Api.TypeMessageAction, actor: string, env: MapEnv): stri
 // ---------------------------------------------------------------- replies
 
 /** Id of the same-chat message this one replies to (forum-topic roots and cross-chat replies excluded). */
+/** The service line "X pinned a message". */
+export function isPinNotice(raw: Api.TypeMessage): boolean {
+  return raw instanceof Api.MessageService && raw.action instanceof Api.MessageActionPinMessage;
+}
+
 export function replyTarget(raw: Api.TypeMessage, chatId?: string): number | undefined {
   if (!(raw instanceof Api.Message || raw instanceof Api.MessageService)) return undefined;
   const rh = raw.replyTo;
