@@ -1,4 +1,4 @@
-import type { AuthState, Chat, EventName, Folder, Member, MentionSpan, Message, SelfInfo, StorageConfig } from "./types.ts";
+import type { AuthState, ButtonAnswer, Chat, EventName, Folder, Member, MentionSpan, Message, SelfInfo, StorageConfig } from "./types.ts";
 import { BridgeError } from "./types.ts";
 import type { SearchParams } from "./search.ts";
 
@@ -83,6 +83,18 @@ export abstract class Adapter {
     throw new BridgeError("unsupported", "media download is not supported");
   }
   async sendTyping(_chatId: string, _typing: boolean): Promise<void> {}
+  /**
+   * messages.clickButton (capability "bot_buttons"): press a bot button the account itself must answer (callback,
+   * game, web app). Other kinds never reach the bridge.
+   */
+  async clickButton(_chatId: string, _messageId: string, _row: number, _column: number): Promise<ButtonAnswer> {
+    throw new BridgeError("unsupported", "bot buttons are not supported");
+  }
+  /**
+   * connection.resume: the computer woke up or its network changed. Adapters check that their socket is still
+   * alive, reconnect at once instead of at the next keep-alive, and fetch whatever the platform queued meanwhile.
+   */
+  async resume(): Promise<void> {}
   /** History transfer from the phone (capability "phone_sync"): start, cancel or just report progress. */
   async phoneSync(_action: "start" | "cancel" | "status"): Promise<unknown> {
     throw new BridgeError("unsupported", "phone sync is not supported");

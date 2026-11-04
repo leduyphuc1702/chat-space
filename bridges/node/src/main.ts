@@ -134,6 +134,18 @@ const handlers: Record<string, (p: Params) => Promise<unknown>> = {
     await adapter.sendTyping(need(p, "chatId"), !!p.typing);
     return {};
   },
+  "messages.clickButton": async (p) => {
+    const row = Number(p.row);
+    const column = Number(p.column);
+    if (!Number.isInteger(row) || row < 0 || !Number.isInteger(column) || column < 0) {
+      throw new BridgeError("invalid_params", "row and column must be non-negative integers");
+    }
+    return adapter.clickButton(need(p, "chatId"), need(p, "messageId"), row, column);
+  },
+  "connection.resume": async () => {
+    await adapter.resume();
+    return {};
+  },
   "chats.folders": async () => ({ folders: await adapter.listFolders() }),
   "storage.configure": async (p) => {
     await adapter.configureStorage({

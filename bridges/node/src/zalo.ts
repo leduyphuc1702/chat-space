@@ -874,6 +874,48 @@ export class ZaloAdapter extends Adapter {
     this.stableTimer = undefined;
   }
 
+  /**
+   * connection.resume: after sleep or a network change. Zalo's socket pings on an interval and the OS may only
+   * report the dead connection minutes later; a socket that is not OPEN, or a reconnect already waiting out its
+   * backoff, is dealt with now. The reconnect replays what was missed (requestOldMessages), as always.
+   */
+  async resume(): Promise<void> {
+    if (this.stopping || this.state !== "logged_in") return;
+    if (this.reconnectTimer) {
+      this.log("resume: reconnecting now instead of after the backoff");
+      this.cancelReconnect();
+      this.failCount = 0;
+      void this.connectWithCreds("reconnect");
+      return;
+    }
+    if (this.connState !== "online") return; // a connection attempt is in progress
+    const ws = (this.api?.listener as unknown as { ws?: { readyState?: number; ping?: (cb?: () => void) => void; terminate?: () => void; once?: (e: string, f: () => void) => void } } | undefined)?.ws;
+    if (!ws) return;
+    if (ws.readyState !== 1) {
+      this.log("resume: socket is not open, reconnecting");
+      this.failCount = 0;
+      this.detachListener(this.api);
+      this.onClosed(1006, "resume");
+      return;
+    }
+    if (typeof ws.ping !== "function" || typeof ws.once !== "function") return;
+    // A ping the server does not answer within a few seconds means the connection died while we slept.
+    const pong = new Promise<boolean>((resolve) => {
+      ws.once!("pong", () => resolve(true));
+      setTimeout(() => resolve(false), 5000).unref?.();
+    });
+    try {
+      ws.ping();
+    } catch {
+      return;
+    }
+    if (await pong) return;
+    if (this.stopping || ws !== (this.api?.listener as unknown as { ws?: unknown } | undefined)?.ws) return;
+    this.log("resume: no pong after 5s, reconnecting");
+    this.failCount = 0;
+    ws.terminate?.(); // the listener's onclose fires -> onClosed -> scheduleReconnect (first attempt: ~2 s)
+  }
+
   /** Stop the listener and every timer; session data stays (see logout() for that). */
   private teardown() {
     this.gen++;

@@ -1,6 +1,15 @@
 import { describe, expect, test } from "bun:test";
 import { Api } from "telegram";
-import { isPinNotice, mapReactions, muteInfo, muteUntilSeconds, normalizeReactionEmoji, reactionEmoticonForTelegram } from "./telegram-map.ts";
+import {
+  isPinNotice,
+  mapMessage,
+  mapReactions,
+  mapReplyMarkup,
+  muteInfo,
+  muteUntilSeconds,
+  normalizeReactionEmoji,
+  reactionEmoticonForTelegram,
+} from "./telegram-map.ts";
 
 const VS16 = "\uFE0F";
 
@@ -82,5 +91,101 @@ describe("isPinNotice", () => {
     expect(isPinNotice(svc(new Api.MessageActionPinMessage()))).toBe(true);
     expect(isPinNotice(svc(new Api.MessageActionChatDeletePhoto()))).toBe(false);
     expect(isPinNotice(new Api.MessageEmpty({ id: 7 }))).toBe(false);
+  });
+});
+
+describe("mapReplyMarkup", () => {
+  const big = (n: number) => BigInt(n) as never;
+  const row = (...buttons: Api.TypeKeyboardButton[]) => new Api.KeyboardButtonRow({ buttons });
+
+  test("inline keyboards become button rows with the action the app needs", () => {
+    const markup = new Api.ReplyInlineMarkup({
+      rows: [
+        row(
+          new Api.KeyboardButtonCallback({ text: "Yes", data: Buffer.from("y") }),
+          new Api.KeyboardButtonUrl({ text: "Docs", url: "https://example.com" }),
+        ),
+        row(
+          new Api.KeyboardButtonSwitchInline({ text: "Share", query: "cats", samePeer: true }),
+          new Api.KeyboardButtonWebView({ text: "App", url: "https://app.example.com" }),
+          new Api.KeyboardButtonCopy({ text: "Copy", copyText: "ABC-123" }),
+          new Api.KeyboardButtonBuy({ text: "Pay" }),
+        ),
+      ],
+    });
+    expect(mapReplyMarkup(markup, "catbot")).toEqual({
+      buttons: [
+        [
+          { text: "Yes", kind: "callback" },
+          { text: "Docs", kind: "url", url: "https://example.com" },
+        ],
+        [
+          { text: "Share", kind: "switch_inline", insert: "@catbot cats", samePeer: true },
+          { text: "App", kind: "web_app", url: "https://app.example.com" },
+          { text: "Copy", kind: "copy", copyText: "ABC-123" },
+          { text: "Pay", kind: "unsupported" },
+        ],
+      ],
+    });
+  });
+
+  test("a switch-inline button without a known bot username has nothing to insert", () => {
+    const markup = new Api.ReplyInlineMarkup({ rows: [row(new Api.KeyboardButtonSwitchInline({ text: "Share", query: "" }))] });
+    expect(mapReplyMarkup(markup)).toEqual({ buttons: [[{ text: "Share", kind: "switch_inline" }]] });
+    expect(mapReplyMarkup(markup, "catbot")).toEqual({ buttons: [[{ text: "Share", kind: "switch_inline", insert: "@catbot " }]] });
+  });
+
+  test("reply keyboards keep their flags; hide and force-reply are reported as such", () => {
+    const kb = new Api.ReplyKeyboardMarkup({
+      rows: [row(new Api.KeyboardButton({ text: "Menu" }), new Api.KeyboardButtonRequestPhone({ text: "Phone" })), row(new Api.KeyboardButton({ text: "Help" }))],
+      resize: true,
+      singleUse: true,
+      placeholder: "Pick one",
+    });
+    expect(mapReplyMarkup(kb)).toEqual({
+      replyKeyboard: {
+        rows: [
+          [
+            { text: "Menu", kind: "text" },
+            { text: "Phone", kind: "unsupported" },
+          ],
+          [{ text: "Help", kind: "text" }],
+        ],
+        resize: true,
+        oneTime: true,
+        placeholder: "Pick one",
+      },
+    });
+    expect(mapReplyMarkup(new Api.ReplyKeyboardHide({}))).toEqual({ hideKeyboard: true });
+    expect(mapReplyMarkup(new Api.ReplyKeyboardForceReply({ placeholder: "Your name", singleUse: true }))).toEqual({
+      forceReply: { placeholder: "Your name", oneTime: true },
+    });
+    expect(mapReplyMarkup(undefined)).toEqual({});
+    expect(mapReplyMarkup(new Api.ReplyInlineMarkup({ rows: [] }))).toEqual({});
+  });
+
+  test("mapMessage carries the keyboard and finds the bot's username for switch-inline", () => {
+    const bot = new Api.User({ id: big(99), bot: true, username: "catbot", firstName: "Cat" });
+    const raw = new Api.Message({
+      id: 5,
+      peerId: new Api.PeerUser({ userId: big(99) }),
+      fromId: new Api.PeerUser({ userId: big(99) }),
+      date: 1,
+      message: "Choose",
+      replyMarkup: new Api.ReplyInlineMarkup({
+        rows: [row(new Api.KeyboardButtonSwitchInline({ text: "Share", query: "q" }), new Api.KeyboardButtonGame({ text: "Play" }))],
+      }),
+    });
+    const env = { selfId: "1", selfName: "Me", entity: (id: string) => (id === "99" ? bot : undefined), readOutboxMax: () => 0 };
+    const m = mapMessage(raw, env)!;
+    expect(m.buttons).toEqual([
+      [
+        { text: "Share", kind: "switch_inline", insert: "@catbot q" },
+        { text: "Play", kind: "game" },
+      ],
+    ]);
+    expect(m.replyKeyboard).toBeUndefined();
+    const plain = mapMessage(new Api.Message({ id: 6, peerId: new Api.PeerUser({ userId: big(99) }), date: 1, message: "x" }), env)!;
+    expect(plain.buttons).toBeUndefined();
   });
 });

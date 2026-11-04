@@ -1,7 +1,7 @@
 // Pure mapping helpers: GramJS TL objects -> ChatSpace protocol objects.
 // No I/O and no state here; everything environment-specific comes in through MapEnv.
 import { Api, utils } from "telegram";
-import type { Chat, ChatKind, Folder, Media, Message, MessageKind, Reaction } from "./types.ts";
+import type { Button, Chat, ChatKind, Folder, Media, Message, MessageKind, Reaction, ReplyKeyboard } from "./types.ts";
 
 export type Entity = Api.TypeUser | Api.TypeChat;
 
@@ -480,6 +480,90 @@ export function previewText(m: Pick<Message, "text" | "kind">): string {
   return (t || KIND_LABEL[m.kind]).slice(0, 200);
 }
 
+// ---------------------------------------------------------------- bot keyboards
+
+/** The @username of a bot (or any user), from the new `usernames` list or the legacy field. */
+export function usernameOf(e?: Entity): string | undefined {
+  if (!(e instanceof Api.User)) return undefined;
+  if (e.username) return e.username;
+  const active = e.usernames?.find((u) => u.active) ?? e.usernames?.[0];
+  return active?.username || undefined;
+}
+
+/**
+ * One Telegram keyboard button -> protocol button. Buttons the app cannot act on (payments, sharing a phone
+ * number / location / poll / chat with the bot) keep their label as `unsupported`, so a row still looks like the
+ * bot designed it.
+ */
+export function mapButton(b: Api.TypeKeyboardButton, botUsername?: string): Button {
+  const text = (b as { text?: string }).text ?? "";
+  if (b instanceof Api.KeyboardButtonCallback || b instanceof Api.KeyboardButtonRequestPeer) {
+    return b instanceof Api.KeyboardButtonCallback ? { text, kind: "callback" } : { text, kind: "unsupported" };
+  }
+  if (b instanceof Api.KeyboardButtonUrl) return { text, kind: "url", url: b.url };
+  if (b instanceof Api.KeyboardButtonUrlAuth) return { text, kind: "login", url: b.url };
+  if (b instanceof Api.KeyboardButtonSwitchInline) {
+    const out: Button = { text, kind: "switch_inline" };
+    if (botUsername) out.insert = `@${botUsername} ${b.query}`.trimEnd() + (b.query ? "" : " ");
+    if (b.samePeer) out.samePeer = true;
+    return out;
+  }
+  if (b instanceof Api.KeyboardButtonWebView || b instanceof Api.KeyboardButtonSimpleWebView) {
+    return { text, kind: "web_app", url: b.url };
+  }
+  if (b instanceof Api.KeyboardButtonGame) return { text, kind: "game" };
+  if (b instanceof Api.KeyboardButtonCopy) return { text, kind: "copy", copyText: b.copyText };
+  if (b instanceof Api.KeyboardButtonUserProfile) return { text, kind: "user_profile", url: `tg://user?id=${b.userId}` };
+  if (b instanceof Api.KeyboardButton) return { text, kind: "text" };
+  // KeyboardButtonBuy, RequestPhone, RequestGeoLocation, RequestPoll, Input* variants
+  return { text, kind: "unsupported" };
+}
+
+function mapRows(rows: Api.TypeKeyboardButtonRow[] | undefined, botUsername?: string): Button[][] {
+  const out: Button[][] = [];
+  for (const r of rows ?? []) {
+    if (!(r instanceof Api.KeyboardButtonRow)) continue;
+    const row = r.buttons.map((b) => mapButton(b, botUsername));
+    if (row.length) out.push(row);
+  }
+  return out;
+}
+
+export interface MappedMarkup {
+  buttons?: Button[][];
+  replyKeyboard?: ReplyKeyboard;
+  hideKeyboard?: boolean;
+  forceReply?: { placeholder?: string; oneTime?: boolean };
+}
+
+/** `Message.replyMarkup` -> the protocol's inline buttons / bot keyboard fields (empty object when there is none). */
+export function mapReplyMarkup(markup: Api.TypeReplyMarkup | undefined, botUsername?: string): MappedMarkup {
+  if (!markup) return {};
+  if (markup instanceof Api.ReplyInlineMarkup) {
+    const buttons = mapRows(markup.rows, botUsername);
+    return buttons.length ? { buttons } : {};
+  }
+  if (markup instanceof Api.ReplyKeyboardMarkup) {
+    const rows = mapRows(markup.rows, botUsername);
+    if (!rows.length) return {};
+    const kb: ReplyKeyboard = { rows };
+    if (markup.resize) kb.resize = true;
+    if (markup.singleUse) kb.oneTime = true;
+    if (markup.persistent) kb.persistent = true;
+    if (markup.selective) kb.selective = true;
+    if (markup.placeholder) kb.placeholder = markup.placeholder;
+    return { replyKeyboard: kb };
+  }
+  if (markup instanceof Api.ReplyKeyboardHide) return { hideKeyboard: true };
+  if (markup instanceof Api.ReplyKeyboardForceReply) {
+    const fr: { placeholder?: string; oneTime?: boolean } = {};
+    if (markup.placeholder) fr.placeholder = markup.placeholder;
+    if (markup.singleUse) fr.oneTime = true;
+    return { forceReply: fr };
+  }
+  return {};
+}
+
 // ---------------------------------------------------------------- messages
 
 export interface MapOptions {
@@ -541,6 +625,15 @@ export function mapMessage(raw: Api.TypeMessage, env: MapEnv, opts: MapOptions =
   if (reactions) msg.reactions = reactions;
   if (fromMe && !raw.post) {
     msg.status = raw.id <= env.readOutboxMax(chatId) ? "read" : "sent";
+  }
+  if (raw.replyMarkup) {
+    // "Switch to inline" buttons need the bot's @username: the bot that sent the message, or the one it was sent via.
+    const bot = raw.viaBotId ? env.entity(String(raw.viaBotId)) : env.entity(senderId);
+    const kb = mapReplyMarkup(raw.replyMarkup, usernameOf(bot));
+    if (kb.buttons) msg.buttons = kb.buttons;
+    if (kb.replyKeyboard) msg.replyKeyboard = kb.replyKeyboard;
+    if (kb.hideKeyboard) msg.hideKeyboard = true;
+    if (kb.forceReply) msg.forceReply = kb.forceReply;
   }
   return msg;
 }

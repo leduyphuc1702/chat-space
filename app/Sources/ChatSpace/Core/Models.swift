@@ -205,6 +205,53 @@ enum DeliveryStatus: String, Codable, Sendable {
     case pending, sent, delivered, read, failed
 }
 
+/// What pressing a bot button does (docs/PROTOCOL.md, capability `bot_buttons`). Unknown kinds decode as `unsupported`.
+enum ButtonKind: String, Codable, Sendable {
+    case callback, url, login, game, text, copy, unsupported
+    case switchInline = "switch_inline"
+    case webApp = "web_app"
+    case userProfile = "user_profile"
+
+    init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = ButtonKind(rawValue: raw) ?? .unsupported
+    }
+}
+
+/// One button of a bot's inline keyboard (`Message.buttons`) or custom keyboard (`ReplyKeyboard.rows`).
+struct BotButton: Codable, Sendable, Equatable, Hashable {
+    var text: String
+    var kind: ButtonKind
+    /// url / login / userProfile: what to open. webApp: the bot's page (the bridge adds the launch data).
+    var url: String?
+    /// switchInline: "@bot query" to put into the composer.
+    var insert: String?
+    var samePeer: Bool?
+    /// copy: the text for the clipboard.
+    var copyText: String?
+
+    /// The account itself must answer the bot (messages.clickButton); the other kinds are handled in the app.
+    var viaBridge: Bool { kind == .callback || kind == .game || kind == .webApp }
+    var isSupported: Bool { kind != .unsupported }
+}
+
+/// A bot's custom keyboard shown under the composer (Telegram ReplyKeyboardMarkup).
+struct ReplyKeyboard: Codable, Sendable, Equatable {
+    var rows: [[BotButton]]
+    var resize: Bool?
+    /// Hidden after one press; the keyboard button brings it back.
+    var oneTime: Bool?
+    var persistent: Bool?
+    var placeholder: String?
+    var selective: Bool?
+}
+
+/// The bot asks for a reply to its message (Telegram ReplyKeyboardForceReply).
+struct ForceReply: Codable, Sendable, Equatable {
+    var placeholder: String?
+    var oneTime: Bool?
+}
+
 struct Message: Codable, Sendable, Identifiable, Equatable {
     var id: String
     var chatId: String
@@ -222,6 +269,12 @@ struct Message: Codable, Sendable, Identifiable, Equatable {
     var deleted: Bool?
     var reactions: [Reaction]?
     var status: DeliveryStatus?
+    /// Inline keyboard under the bubble (bots): rows of buttons.
+    var buttons: [[BotButton]]?
+    /// This message installs a bot keyboard for the chat; `hideKeyboard` removes it.
+    var replyKeyboard: ReplyKeyboard?
+    var hideKeyboard: Bool?
+    var forceReply: ForceReply?
 
     var date: Date { Date(timeIntervalSince1970: timestamp / 1000) }
     var isDeleted: Bool { deleted ?? false }

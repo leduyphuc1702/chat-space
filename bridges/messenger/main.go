@@ -401,6 +401,12 @@ func (s *server) routes() map[string]handler {
 			}
 			return b.loadOpenHistory(ctx, chatID)
 		},
+		"connection.resume": func(ctx context.Context, p params) (any, error) {
+			// The computer woke up or changed networks. messagix runs its own reconnect loop and Meta replays the
+			// tables that were missed once it is back, so there is nothing to force here; answering keeps the app from
+			// logging an unknown method.
+			return map[string]any{}, nil
+		},
 		"typing.send": func(ctx context.Context, p params) (any, error) {
 			chatID, err := p.need("chatId")
 			if err != nil {

@@ -62,6 +62,15 @@ final class PlatformSession {
     /// Pinned messages per chat (chats.pins), most recently pinned first; absent until the chat is opened.
     var pins: [String: [Message]] = [:]
     @ObservationIgnored private var loadingPins: Set<String> = []
+    /// Bot keyboards put away after a one-time press, by the id of the message that installed them.
+    var dismissedKeyboards: Set<String> = []
+    /// Chats whose bot keyboard is folded behind the composer's keyboard button.
+    var collapsedKeyboards: Set<String> = []
+    /// A bot's short answer to a pressed button, shown over the chat for a few seconds.
+    var botToast: [String: String] = [:]
+    /// Buttons waiting for the bot's answer ("chatId|messageId|row|column").
+    var pressingButtons: Set<String> = []
+    @ObservationIgnored private var toastTasks: [String: Task<Void, Never>] = [:]
 
     @ObservationIgnored private var bridge: BridgeProcess?
     @ObservationIgnored private var avatarRequested: Set<String> = []
@@ -185,6 +194,13 @@ final class PlatformSession {
     func call(_ method: String, _ params: [String: JSONValue] = [:]) async throws -> JSONValue {
         guard let bridge else { throw BridgeError.exited }
         return try await bridge.call(method, params)
+    }
+
+    /// The Mac woke up or changed networks: the bridge checks its connection now and fetches what it missed
+    /// (`connection.resume`), instead of finding out at its next keep-alive. Bridges without it answer `unsupported`.
+    func resume() {
+        guard bridge != nil, authState == .loggedIn, !DemoData.enabled else { return }
+        Task { _ = try? await call("connection.resume") }
     }
 
     // MARK: Auth
@@ -399,6 +415,89 @@ final class PlatformSession {
         if messages[chatId] == nil { Task { await loadMessages(chatId) } }
         loadPins(chatId)
         markRead(chatId)
+    }
+
+    // MARK: Bot buttons
+
+    /// The bot keyboard a chat shows under its composer: the newest incoming message that installed one, unless a
+    /// later message removed it (ReplyKeyboardHide) or the user put it away after a one-time press.
+    func botKeyboard(_ chatId: String) -> (message: Message, keyboard: ReplyKeyboard)? {
+        guard can("bot_buttons"), let list = messages[chatId] else { return nil }
+        for m in list.reversed() {
+            if m.hideKeyboard == true { return nil }
+            if let kb = m.replyKeyboard, !m.fromMe, !kb.rows.isEmpty {
+                return dismissedKeyboards.contains(m.id) ? nil : (m, kb)
+            }
+        }
+        return nil
+    }
+
+    /// A button of an inline keyboard (`keyboard` nil) or of the chat's bot keyboard was pressed.
+    func pressButton(_ button: BotButton, row: Int, column: Int, in message: Message, keyboard: ReplyKeyboard? = nil) {
+        let chatId = message.chatId
+        switch button.kind {
+        case .text:
+            // A custom-keyboard button simply sends its label; one-time keyboards fold away after that.
+            if keyboard?.oneTime == true { dismissedKeyboards.insert(message.id) }
+            Task {
+                do { _ = try await post(button.text, in: chatId) } catch { bridgeError = error.localizedDescription }
+            }
+        case .url, .login, .userProfile:
+            if let u = button.url, let url = URL(string: u) { NSWorkspace.shared.open(url) }
+        case .copy:
+            guard let t = button.copyText else { return }
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(t, forType: .string)
+            toast("Text copied to clipboard", in: chatId)
+        case .switchInline:
+            guard let insert = button.insert else { toast("This bot's inline mode is not available in ChatSpace", in: chatId); return }
+            drafts[chatId] = insert
+            DispatchQueue.main.async { Composer.focus() }
+        case .unsupported:
+            toast("This button needs the Telegram app", in: chatId)
+        case .callback, .game, .webApp:
+            if DemoData.enabled { toast("\(message.senderName ?? "Bot"): \(button.text) ✓", in: chatId); return }
+            let key = "\(chatId)|\(message.id)|\(row)|\(column)"
+            guard !pressingButtons.contains(key) else { return }
+            pressingButtons.insert(key)
+            Task {
+                defer { pressingButtons.remove(key) }
+                do {
+                    let r = try await call("messages.clickButton", [
+                        "chatId": .string(chatId), "messageId": .string(message.id),
+                        "row": .number(Double(row)), "column": .number(Double(column)),
+                    ])
+                    if let u = r["url"]?.stringValue, let url = URL(string: u) { NSWorkspace.shared.open(url) }
+                    if let text = r["message"]?.stringValue, !text.isEmpty {
+                        if r["alert"]?.boolValue == true {
+                            let alert = NSAlert()
+                            alert.messageText = message.senderName ?? "Telegram"
+                            alert.informativeText = text
+                            alert.runModal()
+                        } else {
+                            toast(text, in: chatId)
+                        }
+                    }
+                } catch {
+                    toast(error.localizedDescription, in: chatId)
+                }
+            }
+        }
+    }
+
+    /// Shows a bot's answer (or a short notice) over the chat for a few seconds.
+    func toast(_ text: String, in chatId: String) {
+        botToast[chatId] = text
+        toastTasks[chatId]?.cancel()
+        toastTasks[chatId] = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            guard !Task.isCancelled else { return }
+            self?.botToast[chatId] = nil
+        }
+    }
+
+    func toggleBotKeyboard(_ chatId: String) {
+        if collapsedKeyboards.contains(chatId) { collapsedKeyboards.remove(chatId) } else { collapsedKeyboards.insert(chatId) }
     }
 
     // MARK: Pins & mute
@@ -1106,6 +1205,13 @@ final class PlatformSession {
             if let m = try? data["message"]?.decode(Message.self) {
                 upsert(m)
                 clearTyping(chatId: m.chatId, userId: m.senderId)
+                if !m.fromMe {
+                    // A new bot keyboard unfolds; a bot asking for a reply gets the composer set to it (as in Telegram).
+                    if m.replyKeyboard != nil { collapsedKeyboards.remove(m.chatId) }
+                    if m.forceReply != nil, data["live"]?.boolValue == true, isViewing(m.chatId), replyingTo[m.chatId] == nil {
+                        replyingTo[m.chatId] = m
+                    }
+                }
                 guard !m.fromMe, data["live"]?.boolValue == true, firstSighting(m) else { return }
                 if isViewing(m.chatId) {
                     markRead(m.chatId)

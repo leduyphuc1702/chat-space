@@ -27,10 +27,13 @@ import { UpdateConnectionState } from "telegram/network";
 import { StringSession } from "telegram/sessions";
 import { Adapter, type AdapterContext } from "./adapter.ts";
 import { Matcher, newestFirst, type SearchParams } from "./search.ts";
+import { channelPts, commonPts, judgePts, parseSavedState, type SavedUpdateState, type UpdateState } from "./telegram-updates.ts";
 import { sanitizeMentions, TtlCache } from "./mentions.ts";
 import {
   BridgeError,
   isFresh,
+  LIVE_MAX_AGE_MS,
+  type ButtonAnswer,
   type Chat,
   type Folder,
   type Member,
@@ -84,6 +87,20 @@ const MEMBERS_TTL_MS = 5 * 60_000;
 const MEMBERS_LIMIT = 200;
 /** Pinned messages fetched per chat. */
 const PINS_LIMIT = 100;
+/**
+ * updates.getDifference is asked to give up (DifferenceTooLong) past this many pending updates; the chat list is
+ * then re-read instead, like the official apps do after a long absence. Below it every missed message is delivered
+ * one by one (message.new), which keeps open chats current and notifies for the recent ones.
+ */
+const DIFFERENCE_TOTAL_LIMIT = 500;
+/** Pages of updates.getChannelDifference (100 messages each) per catch-up of one channel. */
+const CHANNEL_DIFFERENCE_PAGES = 5;
+/** How long an out-of-order update may take to fill a pts gap before getDifference is asked to. */
+const GAP_GRACE_MS = 600;
+/** connection.resume: a request that is not answered within this time means the socket died while the computer slept. */
+const RESUME_PROBE_MS = 4000;
+/** The update state file is written at most this often while the stream is busy (and always on shutdown). */
+const STATE_SAVE_DELAY_MS = 10_000;
 const execFileP = promisify(execFile);
 
 // ------------------------------------------------------------------ small utils
@@ -420,7 +437,7 @@ type RawUpdate = { _entities?: Map<string, Entity> };
 export class TelegramAdapter extends Adapter {
   readonly platform = "telegram";
   // "edit" is deliberately absent: the protocol has no edit method yet.
-  readonly capabilities = ["reactions", "reply", "delete", "edit", "typing", "read_receipts", "media_send", "voice", "folders", "mentions", "forward", "search", "mute", "pins"];
+  readonly capabilities = ["reactions", "reply", "delete", "edit", "typing", "read_receipts", "media_send", "voice", "folders", "mentions", "forward", "search", "mute", "pins", "bot_buttons"];
 
   private creds?: Creds;
   private client?: TelegramClient;
@@ -469,6 +486,27 @@ export class TelegramAdapter extends Adapter {
   private foldersForce = false;
   /** Re-announce folders once the first chats.list of a session has loaded the dialogs. */
   private foldersAfterChats = false;
+
+  /**
+   * Position in Telegram's update stream (updates.getState), kept in step with every live update and persisted, so a
+   * reconnect or restart can ask updates.getDifference for exactly what was missed instead of waiting for the user
+   * to open a chat. Channels each have their own pts (`chanPts`, by chat id) and updates.getChannelDifference.
+   */
+  private updState?: UpdateState;
+  private readonly chanPts = new Map<string, number>();
+  /** When the stream last delivered something: messages after that moment arrived while we were cut off. */
+  private streamAliveAt = 0;
+  private stateDirty = false;
+  private stateTimer?: ReturnType<typeof setTimeout>;
+  /** One getDifference run at a time; a trigger during a run makes it go round once more. */
+  private catchUpJob?: Promise<void>;
+  private catchUpAgain = false;
+  private gapTimer?: ReturnType<typeof setTimeout>;
+  private gapTarget = 0;
+  private readonly channelJobs = new Map<string, Promise<void>>();
+  private readonly channelAgain = new Set<string>();
+  private readonly channelGapTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private readonly channelGapTargets = new Map<string, number>();
 
   /** Storage policy pushed by the app. Until it arrives nothing is pruned and nothing is re-encoded. */
   private storage: StorageConfig = { keepMediaDays: 0, maxCacheMB: 0, compressImages: false, maxStoredMessagesPerChat: 0 };
@@ -587,6 +625,15 @@ export class TelegramAdapter extends Adapter {
     client.setLogLevel(LogLevel.ERROR);
     // GramJS parses outgoing text as Markdown by default; users expect their text sent verbatim.
     client.setParseMode(undefined);
+    // Updates that come back as the result of a request (our own sends, forwards, reads) are never pushed again on
+    // the stream, yet they move the account's pts: GramJS does not hand them to update handlers, so look at every
+    // result here. Otherwise each message we send would look like a gap to fill.
+    const invoke = client.invoke.bind(client);
+    client.invoke = (async (request: Api.AnyRequest, dcId?: number) => {
+      const result = await invoke(request as never, dcId);
+      this.noteResultUpdates(result);
+      return result;
+    }) as typeof client.invoke;
 
     client.addEventHandler(
       (e: NewMessageEvent) => this.safely("new message", () => this.onNewMessage(e)),
@@ -646,6 +693,19 @@ export class TelegramAdapter extends Adapter {
     this.folders = [];
     this.foldersJson = "";
     this.lastSavedSession = "";
+    this.updState = undefined;
+    this.chanPts.clear();
+    this.stateDirty = false;
+    if (this.stateTimer) clearTimeout(this.stateTimer);
+    this.stateTimer = undefined;
+    if (this.gapTimer) clearTimeout(this.gapTimer);
+    this.gapTimer = undefined;
+    this.gapTarget = 0;
+    this.catchUpAgain = false;
+    for (const t of this.channelGapTimers.values()) clearTimeout(t);
+    this.channelGapTimers.clear();
+    this.channelGapTargets.clear();
+    this.channelAgain.clear();
   }
 
   // -------------------------------------------------------------- start / restore
@@ -722,15 +782,20 @@ export class TelegramAdapter extends Adapter {
     this.self = this.selfInfo(me);
     this.saveSession();
     if (!this.saveTimer) {
-      this.saveTimer = setInterval(() => this.saveSession(), 60_000);
+      this.saveTimer = setInterval(() => {
+        this.saveSession();
+        if (this.stateDirty) this.saveUpdateState();
+      }, 60_000);
       this.saveTimer.unref?.();
     }
-    // Subscribing to updates: the server only streams them after an authorized state request.
-    this.client?.invoke(new Api.updates.GetState()).catch((e) => this.ctx.log("GetState failed", describeError(e)));
     // Mute can be inherited from "all private chats / groups / channels": know the defaults before chats.list runs.
     await Promise.race([this.loadNotifyScopes(), sleep(4000)]);
     this.foldersAfterChats = true; // chats.list re-announces the folders once the dialogs are loaded
     this.setState("logged_in");
+    // Subscribing to updates: the server only streams them after an authorized request. With a saved stream
+    // position that request is getDifference, which also brings in whatever arrived while the bridge was away.
+    this.loadUpdateState(this.self.id);
+    void this.catchUp("connect");
     this.scheduleFolders(300, true);
     void this.refreshSelfAvatar();
   }
@@ -779,6 +844,7 @@ export class TelegramAdapter extends Adapter {
     this.bootId++;
     this.self = undefined;
     rmSafe(this.sessionFile);
+    rmSafe(this.stateFile);
     await this.destroyClient();
     this.resetCaches();
     this.emitConnection("offline");
@@ -1107,6 +1173,7 @@ export class TelegramAdapter extends Adapter {
     }
     await this.destroyClient();
     rmSafe(this.sessionFile);
+    rmSafe(this.stateFile);
     try {
       rmSync(this.avatarDir, { recursive: true, force: true });
       mkdirSync(this.avatarDir, { recursive: true });
@@ -1124,7 +1191,11 @@ export class TelegramAdapter extends Adapter {
     this.bootId++;
     if (this.saveTimer) clearInterval(this.saveTimer);
     if (this.foldersTimer) clearTimeout(this.foldersTimer);
+    if (this.stateTimer) clearTimeout(this.stateTimer);
+    if (this.gapTimer) clearTimeout(this.gapTimer);
+    for (const t of this.channelGapTimers.values()) clearTimeout(t);
     this.saveSession();
+    this.saveUpdateState();
     await this.cancelRun();
     for (const t of this.typingTimers.values()) clearTimeout(t);
     await this.destroyClient();
@@ -1259,7 +1330,12 @@ export class TelegramAdapter extends Adapter {
       if (m instanceof Api.Message || m instanceof Api.MessageService) msgs.set(`${peerKey(m.peerId)}:${m.id}`, m);
     }
     const dialogs = r.dialogs.filter((d): d is Api.Dialog => d instanceof Api.Dialog);
-    for (const d of dialogs) this.readOutbox.set(peerKey(d.peer), d.readOutboxMaxId);
+    for (const d of dialogs) {
+      const key = peerKey(d.peer);
+      this.readOutbox.set(key, d.readOutboxMaxId);
+      // A channel dialog carries the channel's current pts: the starting point for its getChannelDifference.
+      if (d.pts !== undefined && d.pts !== null && d.peer instanceof Api.PeerChannel) this.noteDialogPts(key, d.pts);
+    }
 
     const env = this.mapEnv();
     const out: Chat[] = [];
@@ -2175,6 +2251,529 @@ export class TelegramAdapter extends Adapter {
     }
   }
 
+  // -------------------------------------------------------------- bot buttons
+
+  /**
+   * messages.clickButton: press button [row][column] of a message for the kinds only the account can act on.
+   * The button is read again from the server (bots edit their keyboards all the time), so the app only sends its
+   * position. Callback and game buttons ask the bot (messages.getBotCallbackAnswer); web-app buttons get the page
+   * URL with the launch parameters attached (messages.requestWebView). Every other kind is the app's job.
+   */
+  async clickButton(chatId: string, messageId: string, row: number, column: number): Promise<ButtonAnswer> {
+    const client = this.requireClient();
+    return this.guard(async () => {
+      const peer = await this.inputPeer(chatId);
+      const id = parseMsgId(messageId);
+      const [raw] = await client.getMessages(peer, { ids: id });
+      if (!(raw instanceof Api.Message)) throw new BridgeError("not_found", "This message is no longer available");
+      const markup = raw.replyMarkup;
+      const rows = markup instanceof Api.ReplyInlineMarkup || markup instanceof Api.ReplyKeyboardMarkup ? markup.rows : [];
+      const r = rows[row];
+      const button = r instanceof Api.KeyboardButtonRow ? r.buttons[column] : undefined;
+      if (!button) throw new BridgeError("not_found", "This button is no longer on the message");
+
+      if (button instanceof Api.KeyboardButtonCallback || button instanceof Api.KeyboardButtonGame) {
+        if (button instanceof Api.KeyboardButtonCallback && button.requiresPassword) {
+          throw new BridgeError("unsupported", "This button needs your two-step verification password; use Telegram for it.");
+        }
+        const a = await client.invoke(
+          new Api.messages.GetBotCallbackAnswer({
+            peer,
+            msgId: id,
+            data: button instanceof Api.KeyboardButtonCallback ? button.data : undefined,
+            game: button instanceof Api.KeyboardButtonGame ? true : undefined,
+          }),
+        );
+        const out: ButtonAnswer = {};
+        if (a.message) out.message = a.message;
+        if (a.alert) out.alert = true;
+        if (a.url) out.url = a.url;
+        return out;
+      }
+
+      if (button instanceof Api.KeyboardButtonWebView || button instanceof Api.KeyboardButtonSimpleWebView) {
+        const bot = await this.inputUserOfBot(raw, peer);
+        const platform = process.platform === "win32" ? "tdesktop" : "macos";
+        const res =
+          button instanceof Api.KeyboardButtonSimpleWebView
+            ? await client.invoke(new Api.messages.RequestSimpleWebView({ bot, url: button.url, platform }))
+            : await client.invoke(new Api.messages.RequestWebView({ peer, bot, url: button.url, platform }));
+        return { url: res.url };
+      }
+
+      throw new BridgeError("unsupported", "This button is handled by the app");
+    });
+  }
+
+  /** The bot behind a message (the one it was sent via, its sender, or the bot the chat is with) as an InputUser. */
+  private async inputUserOfBot(raw: Api.Message, chatPeer: Api.TypeInputPeer): Promise<Api.TypeInputUser> {
+    const toUser = (p: Api.TypeInputPeer): Api.TypeInputUser | undefined => {
+      if (p instanceof Api.InputPeerUser) return new Api.InputUser({ userId: p.userId, accessHash: p.accessHash });
+      if (p instanceof Api.InputPeerSelf) return new Api.InputUserSelf();
+      return undefined;
+    };
+    const candidates: string[] = [];
+    if (raw.viaBotId) candidates.push(String(raw.viaBotId));
+    if (raw.fromId instanceof Api.PeerUser) candidates.push(peerKey(raw.fromId));
+    for (const id of candidates) {
+      try {
+        const u = toUser(await this.inputPeer(id));
+        if (u) return u;
+      } catch {
+        /* try the next */
+      }
+    }
+    const own = toUser(chatPeer);
+    if (own) return own;
+    throw new BridgeError("not_found", "Could not tell which bot this button belongs to");
+  }
+
+  // -------------------------------------------------------------- update sequence (pts) and catch-up
+
+  private get stateFile() {
+    return join(this.ctx.dataDir, "updates-state.json");
+  }
+
+  private loadUpdateState(selfId: string) {
+    let text: string;
+    try {
+      text = readFileSync(this.stateFile, "utf8");
+    } catch {
+      return;
+    }
+    const saved = parseSavedState(text, selfId);
+    if (!saved) return;
+    this.updState = { pts: saved.pts, qts: saved.qts, date: saved.date, seq: saved.seq };
+    for (const [id, pts] of Object.entries(saved.channels)) this.chanPts.set(id, pts);
+  }
+
+  private saveUpdateState() {
+    this.stateDirty = false;
+    const st = this.updState;
+    if (!st || !this.self) return;
+    const channels: Record<string, number> = {};
+    for (const [id, pts] of this.chanPts) channels[id] = pts;
+    const saved: SavedUpdateState = { selfId: this.self.id, ...st, channels };
+    try {
+      atomicWrite(this.stateFile, JSON.stringify(saved), 0o600);
+    } catch (e) {
+      this.ctx.log("could not save update state", describeError(e));
+    }
+  }
+
+  private markStateDirty() {
+    if (this.stateDirty) return;
+    this.stateDirty = true;
+    this.stateTimer = setTimeout(() => {
+      this.stateTimer = undefined;
+      if (this.stateDirty) this.saveUpdateState();
+    }, STATE_SAVE_DELAY_MS);
+    this.stateTimer.unref?.();
+  }
+
+  /**
+   * Keep the account-wide and per-channel pts in step with one update. A step that does not follow the local
+   * position is a gap; after a short grace period (updates may arrive out of order) the difference is fetched.
+   * `channelsOnly`: the update came out of getDifference, whose state replaces the common pts afterwards.
+   */
+  private trackPts(u: unknown, opts: { channelsOnly?: boolean } = {}) {
+    const st = this.updState;
+    const c = opts.channelsOnly ? undefined : commonPts(u);
+    if (c && st) {
+      const verdict = judgePts(st.pts, c);
+      if (verdict === "applied") {
+        st.pts = c.pts;
+        this.markStateDirty();
+      } else if (verdict === "gap") {
+        this.noteGap(c.pts - c.ptsCount);
+      }
+      const date = (u as { date?: unknown }).date;
+      if (typeof date === "number" && date > st.date) st.date = date;
+    }
+    const ch = channelPts(u);
+    if (ch) {
+      const local = this.chanPts.get(ch.chatId);
+      if (local === undefined) {
+        this.chanPts.set(ch.chatId, ch.pts); // first sign of life from this channel: start counting here
+        this.markStateDirty();
+        return;
+      }
+      const verdict = judgePts(local, ch);
+      if (verdict === "applied") {
+        this.chanPts.set(ch.chatId, ch.pts);
+        this.markStateDirty();
+      } else if (verdict === "gap") {
+        this.noteChannelGap(ch.chatId, ch.pts - ch.ptsCount);
+      }
+    }
+  }
+
+  /** Updates returned by a request (sends, forwards, reads) move the pts too; see createClient. */
+  private noteResultUpdates(result: unknown) {
+    if (!this.self) return;
+    const st = this.updState;
+    if (result instanceof Api.Updates || result instanceof Api.UpdatesCombined) {
+      this.rememberEntities([...result.users, ...result.chats]);
+      for (const u of result.updates) this.trackPts(u);
+      if (st && result.date > st.date) st.date = result.date;
+    } else if (result instanceof Api.UpdateShort) {
+      this.trackPts(result.update);
+      if (st && result.date > st.date) st.date = result.date;
+    } else if (
+      result instanceof Api.UpdateShortSentMessage ||
+      result instanceof Api.UpdateShortMessage ||
+      result instanceof Api.UpdateShortChatMessage
+    ) {
+      this.trackPts(result);
+    }
+  }
+
+  private noteGap(expectedPts: number) {
+    this.gapTarget = Math.max(this.gapTarget, expectedPts);
+    if (this.gapTimer) return;
+    this.gapTimer = setTimeout(() => {
+      this.gapTimer = undefined;
+      const target = this.gapTarget;
+      this.gapTarget = 0;
+      if (this.updState && this.updState.pts < target) void this.catchUp("pts gap");
+    }, GAP_GRACE_MS);
+    this.gapTimer.unref?.();
+  }
+
+  private noteChannelGap(chatId: string, expectedPts: number) {
+    this.channelGapTargets.set(chatId, Math.max(this.channelGapTargets.get(chatId) ?? 0, expectedPts));
+    if (this.channelGapTimers.has(chatId)) return;
+    const t = setTimeout(() => {
+      this.channelGapTimers.delete(chatId);
+      const target = this.channelGapTargets.get(chatId) ?? 0;
+      this.channelGapTargets.delete(chatId);
+      const local = this.chanPts.get(chatId);
+      if (local !== undefined && local < target) void this.channelCatchUp(chatId, "pts gap");
+    }, GAP_GRACE_MS);
+    t.unref?.();
+    this.channelGapTimers.set(chatId, t);
+  }
+
+  /** A dialog read from the server tells the channel's current pts. */
+  private noteDialogPts(chatId: string, pts: number) {
+    const local = this.chanPts.get(chatId);
+    if (local !== undefined && local >= pts) return;
+    this.chanPts.set(chatId, pts);
+    this.markStateDirty();
+    // Only a channel the app already shows is worth the extra request for the messages in between; for the rest
+    // the dialog itself (last message, unread count) is the catch-up.
+    if (local !== undefined && this.chats.has(chatId)) void this.channelCatchUp(chatId, "dialog ahead", local);
+  }
+
+  /**
+   * Fetch everything the server queued since our last known position (updates.getDifference), on connect,
+   * reconnect, UpdatesTooLong, a pts gap and connection.resume. Missed messages are delivered as message.new
+   * (live when fresh, so a message that came in while the laptop was asleep still notifies, as in Telegram's own
+   * apps), then the affected chats are re-read for their exact unread counts.
+   */
+  private catchUp(reason: string): Promise<void> {
+    if (this.catchUpJob) {
+      this.catchUpAgain = true;
+      return this.catchUpJob;
+    }
+    const job = (async () => {
+      do {
+        this.catchUpAgain = false;
+        try {
+          await this.catchUpOnce(reason);
+        } catch (e) {
+          if (isAuthError(e)) {
+            void this.onSessionLost();
+            return;
+          }
+          this.ctx.log(`telegram catch-up (${reason}) failed: ${describeError(e)}`);
+          return;
+        }
+      } while (this.catchUpAgain && !this.stopped);
+    })().finally(() => {
+      this.catchUpJob = undefined;
+    });
+    this.catchUpJob = job;
+    return job;
+  }
+
+  private async catchUpOnce(reason: string) {
+    const client = this.client;
+    if (!client || !this.self || this.state !== "logged_in") return;
+    const boot = this.bootId;
+    const st = this.updState;
+    if (!st) {
+      // Nothing to resume from: start counting now.
+      const s = await client.invoke(new Api.updates.GetState());
+      if (boot !== this.bootId || this.client !== client) return;
+      this.updState = { pts: s.pts, qts: s.qts, date: s.date, seq: s.seq };
+      this.saveUpdateState();
+      return;
+    }
+
+    const touched = new Set<string>();
+    let tooLong = false;
+    let messages = 0;
+    for (let page = 0; page < 50; page++) {
+      const d = await client.invoke(
+        new Api.updates.GetDifference({ pts: st.pts, date: st.date, qts: st.qts, ptsTotalLimit: DIFFERENCE_TOTAL_LIMIT }),
+      );
+      if (boot !== this.bootId || this.client !== client) return;
+      if (d instanceof Api.updates.DifferenceEmpty) {
+        st.date = d.date;
+        st.seq = d.seq;
+        break;
+      }
+      if (d instanceof Api.updates.DifferenceTooLong) {
+        st.pts = d.pts;
+        tooLong = true;
+        break;
+      }
+      this.rememberEntities([...d.users, ...d.chats]);
+      const news = d.newMessages.filter((m): m is RawMessage => m instanceof Api.Message || m instanceof Api.MessageService);
+      messages += news.length;
+      await this.processMissed(news, touched);
+      for (const u of d.otherUpdates) await this.applyDifferenceUpdate(u, touched);
+      const s = d instanceof Api.updates.Difference ? d.state : d.intermediateState;
+      st.pts = s.pts;
+      st.qts = s.qts;
+      st.date = s.date;
+      st.seq = s.seq;
+      if (d instanceof Api.updates.Difference) break;
+    }
+    if (messages || tooLong) this.ctx.log(`telegram catch-up (${reason}): ${tooLong ? "too long, re-reading chats" : `${messages} missed message(s)`}`);
+    if (tooLong) await this.resyncChats();
+    else if (touched.size) await this.refreshDialogs([...touched]);
+    this.saveUpdateState();
+  }
+
+  /** One update out of a difference: messages are delivered, UpdateChannelTooLong starts that channel's catch-up. */
+  private async applyDifferenceUpdate(u: Api.TypeUpdate, touched: Set<string>) {
+    if (u instanceof Api.UpdateNewMessage || u instanceof Api.UpdateNewChannelMessage) {
+      this.trackPts(u, { channelsOnly: true });
+      const raw = u.message;
+      if (raw instanceof Api.Message || raw instanceof Api.MessageService) await this.processMissed([raw], touched);
+      return;
+    }
+    await this.onUpdate(u, { fromDifference: true });
+  }
+
+  /**
+   * Deliver messages that were not pushed to us (a difference page, the gap of a channel). Per chat and in order,
+   * through the same queue as live messages; replies are resolved with one request per chat rather than one per
+   * message. Messages already shown (seen live before the gap was noticed, or returned by our own send) are skipped.
+   */
+  private async processMissed(raws: RawMessage[], touched?: Set<string>) {
+    const byChat = new Map<string, RawMessage[]>();
+    for (const raw of raws) {
+      const peer = (raw as { peerId?: Api.TypePeer }).peerId;
+      if (!peer) continue; // MessageEmpty
+      const list = byChat.get(peerKey(peer)) ?? [];
+      list.push(raw);
+      byChat.set(peerKey(peer), list);
+    }
+    for (const [chatId, list] of byChat) {
+      await this.serial(async () => {
+        list.sort((a, b) => a.id - b.id);
+        const fresh: { raw: RawMessage; msg: Message }[] = [];
+        for (const raw of list) {
+          const msg = await this.toProtocol(raw);
+          if (!msg) continue;
+          if (isPinNotice(raw)) this.invalidatePins(chatId);
+          const key = `${chatId}:${msg.id}`;
+          const known = this.sentKeys.has(key) || this.recent.has(key);
+          this.rememberMessage(msg);
+          if (!known) fresh.push({ raw, msg });
+        }
+        if (!fresh.length) return;
+        await this.fillReplies(
+          chatId,
+          fresh.map((x) => x.raw),
+          fresh.map((x) => x.msg),
+        );
+        // The app needs the chat before the first message.new of a chat it has not seen.
+        if (!this.chats.has(chatId)) await this.ensureChat(fresh[0]!.msg);
+        for (const { raw, msg } of fresh) {
+          if (!msg.fromMe) this.stopTyping(chatId, msg.senderId);
+          const silent = (raw as { silent?: boolean }).silent === true;
+          // Telegram's apps notify for what came in while the connection was down (a closed laptop), not for what a
+          // fresh start finds; here "down" is anything after the stream's last sign of life, within a day.
+          const missedWhileDown =
+            this.streamAliveAt > 0 && msg.timestamp >= this.streamAliveAt - LIVE_MAX_AGE_MS && Date.now() - msg.timestamp <= DAY_MS;
+          const live = !msg.fromMe && msg.kind !== "system" && !silent && (isFresh(msg.timestamp) || missedWhileDown);
+          this.ctx.emit("message.new", { message: msg, live });
+        }
+        touched?.add(chatId);
+      });
+    }
+  }
+
+  /** Catch up one channel (updates.getChannelDifference) from its last known pts, or from `fromPts`. */
+  private channelCatchUp(chatId: string, reason: string, fromPts?: number): Promise<void> {
+    const running = this.channelJobs.get(chatId);
+    if (running) {
+      this.channelAgain.add(chatId);
+      return running;
+    }
+    const job = (async () => {
+      let start = fromPts;
+      do {
+        this.channelAgain.delete(chatId);
+        try {
+          await this.channelCatchUpOnce(chatId, reason, start);
+        } catch (e) {
+          if (isAuthError(e)) {
+            void this.onSessionLost();
+            return;
+          }
+          this.ctx.log(`telegram channel catch-up ${chatId} (${reason}) failed: ${describeError(e)}`);
+          return;
+        }
+        start = undefined;
+      } while (this.channelAgain.has(chatId) && !this.stopped);
+    })().finally(() => {
+      this.channelJobs.delete(chatId);
+    });
+    this.channelJobs.set(chatId, job);
+    return job;
+  }
+
+  private async channelCatchUpOnce(chatId: string, reason: string, fromPts?: number) {
+    const client = this.client;
+    if (!client || !this.self || this.state !== "logged_in") return;
+    const boot = this.bootId;
+    const peer = await this.inputPeer(chatId);
+    if (!(peer instanceof Api.InputPeerChannel)) return;
+    const channel = new Api.InputChannel({ channelId: peer.channelId, accessHash: peer.accessHash });
+    const known = fromPts ?? this.chanPts.get(chatId);
+    if (known === undefined) {
+      // Never saw this channel's pts: the dialog gives it, and whatever is newer than the last message we know.
+      await this.fillChannelGap(chatId);
+      return;
+    }
+    let pts: number = known;
+
+    const touched = new Set<string>();
+    let messages = 0;
+    for (let page = 0; page < CHANNEL_DIFFERENCE_PAGES; page++) {
+      const d: Api.updates.TypeChannelDifference = await client.invoke(
+        new Api.updates.GetChannelDifference({ channel, filter: new Api.ChannelMessagesFilterEmpty(), pts, limit: 100 }),
+      );
+      if (boot !== this.bootId || this.client !== client) return;
+      if (d instanceof Api.updates.ChannelDifferenceEmpty) {
+        pts = d.pts;
+        break;
+      }
+      if (d instanceof Api.updates.ChannelDifferenceTooLong) {
+        // Too much happened: the server sends the dialog as it is now plus the latest messages.
+        this.rememberEntities([...d.users, ...d.chats]);
+        if (d.dialog instanceof Api.Dialog) {
+          const dialogPts = d.dialog.pts;
+          if (typeof dialogPts === "number") pts = dialogPts;
+          const chats = this.ingestDialogs({ dialogs: [d.dialog], messages: d.messages, chats: d.chats, users: d.users });
+          for (const chat of chats) this.ctx.emit("chat.upsert", { chat });
+        }
+        const latest = d.messages.filter((m): m is RawMessage => m instanceof Api.Message || m instanceof Api.MessageService);
+        messages += latest.length;
+        await this.processMissed(latest);
+        break;
+      }
+      this.rememberEntities([...d.users, ...d.chats]);
+      // Set first: the updates of this page carry pts values up to d.pts and must not read as gaps.
+      pts = d.pts;
+      this.chanPts.set(chatId, pts);
+      const news = d.newMessages.filter((m): m is RawMessage => m instanceof Api.Message || m instanceof Api.MessageService);
+      messages += news.length;
+      await this.processMissed(news, touched);
+      for (const u of d.otherUpdates) await this.applyDifferenceUpdate(u, touched);
+      if (d.final !== false) break;
+    }
+    this.chanPts.set(chatId, pts);
+    this.markStateDirty();
+    if (messages) this.ctx.log(`telegram channel catch-up ${chatId} (${reason}): ${messages} missed message(s)`);
+    if (touched.size) await this.refreshDialogs([...touched]);
+  }
+
+  /** Channel without a known pts: read its dialog (which has one) and the messages after the last one we know. */
+  private async fillChannelGap(chatId: string) {
+    const client = this.client;
+    if (!client) return;
+    const lastKnown = Number(this.chats.get(chatId)?.lastMessage?.id ?? 0);
+    const chat = await this.refreshDialog(chatId, true); // records the dialog's pts via ingestDialogs
+    if (!chat || !lastKnown) return;
+    const top = Number(chat.lastMessage?.id ?? 0);
+    if (top <= lastKnown) return;
+    const peer = await this.inputPeer(chatId);
+    const batch = await client.getMessages(peer, { minId: lastKnown, limit: 100 });
+    const raws = [...batch] as RawMessage[]; // GramJS types every entry as Message; processMissed skips MessageEmpty
+    for (const raw of raws) this.rememberEntities((raw as unknown as RawUpdate)._entities);
+    await this.processMissed(raws);
+  }
+
+  /** Re-read dialogs from the server (exact unread counts, last messages) and announce them. */
+  private async refreshDialogs(chatIds: string[]) {
+    const client = this.client;
+    if (!client) return;
+    for (let i = 0; i < chatIds.length; i += 100) {
+      const slice = chatIds.slice(i, i + 100);
+      const peers: Api.InputDialogPeer[] = [];
+      for (const id of slice) {
+        try {
+          peers.push(new Api.InputDialogPeer({ peer: await this.inputPeer(id) }));
+        } catch {
+          /* unknown peer: nothing to refresh */
+        }
+      }
+      if (!peers.length) continue;
+      try {
+        const r = await client.invoke(new Api.messages.GetPeerDialogs({ peers }));
+        for (const chat of this.ingestDialogs(r)) this.ctx.emit("chat.upsert", { chat });
+      } catch (e) {
+        if (isAuthError(e)) throw e;
+        this.ctx.log(`could not refresh ${slice.length} chat(s) after catch-up: ${describeError(e)}`);
+      }
+    }
+  }
+
+  /** Too much was missed to replay: read the chat list again and announce every chat, like a fresh chats.list. */
+  private async resyncChats() {
+    try {
+      for (const chat of await this.listChats(200)) this.ctx.emit("chat.upsert", { chat });
+    } catch (e) {
+      if (isAuthError(e)) throw e;
+      this.ctx.log(`could not re-read chats after a long gap: ${describeError(e)}`);
+    }
+  }
+
+  /**
+   * connection.resume: the computer woke up or changed networks. GramJS notices a dead socket only at its next
+   * ping (several seconds, longer under load); a request that is not answered quickly tells us now, and the
+   * reconnect is forced. A live socket just catches up, since the server kept nothing for us while we slept.
+   */
+  async resume(): Promise<void> {
+    const client = this.client;
+    if (!client || this.state !== "logged_in" || !this.self) return;
+    const alive = await Promise.race([
+      client.invoke(new Api.updates.GetState()).then(
+        () => true,
+        () => false,
+      ),
+      sleep(RESUME_PROBE_MS).then(() => false),
+    ]);
+    if (this.client !== client) return;
+    if (!alive) {
+      this.ctx.log("telegram: no answer after resume, reconnecting");
+      this.emitConnection("connecting", "reconnecting");
+      try {
+        (client as unknown as { _sender?: { reconnect?: () => void } })._sender?.reconnect?.();
+      } catch (e) {
+        this.ctx.log("telegram: forced reconnect failed", describeError(e));
+      }
+      return; // the connected event that follows runs the catch-up
+    }
+    await this.catchUp("resume");
+  }
+
   // -------------------------------------------------------------- realtime
 
   private async onNewMessage(event: NewMessageEvent) {
@@ -2198,6 +2797,8 @@ export class TelegramAdapter extends Adapter {
   private async processNew(raw: RawMessage) {
     const msg = await this.toProtocol(raw);
     if (!msg) return;
+    const date = (raw as { date?: number }).date;
+    if (this.updState && typeof date === "number" && date > this.updState.date) this.updState.date = date; // "date of last update"
     if (isPinNotice(raw)) this.invalidatePins(msg.chatId);
     const key = `${msg.chatId}:${msg.id}`;
     const alreadySent = this.sentKeys.has(key); // returned by our own sendMessage
@@ -2264,7 +2865,12 @@ export class TelegramAdapter extends Adapter {
     this.ctx.emit("chat.upsert", { chat });
   }
 
-  private async onUpdate(u: unknown) {
+  /**
+   * Raw update handler. `fromDifference`: the update was fetched by getDifference / getChannelDifference rather
+   * than pushed; the stream position then comes from the difference itself, so no gap detection, and plain
+   * messages (normally the NewMessage handler's job) are delivered from here.
+   */
+  private async onUpdate(u: unknown, opts: { fromDifference?: boolean } = {}) {
     if (u instanceof UpdateConnectionState) {
       const prev = this.connState;
       const s =
@@ -2275,8 +2881,8 @@ export class TelegramAdapter extends Adapter {
             : "connecting";
       this.emitConnection(s, s === "connecting" ? "reconnecting" : undefined);
       if (s === "online" && prev && prev !== "online" && this.self) {
-        // re-arm the update stream after a reconnect
-        this.client?.invoke(new Api.updates.GetState()).catch(() => {});
+        // The server drops what it could not deliver while we were away: fetch it (and re-arm the stream).
+        void this.catchUp("reconnect");
       }
       return;
     }
@@ -2285,13 +2891,26 @@ export class TelegramAdapter extends Adapter {
       return;
     }
     if (!this.self) return;
+    if (!opts.fromDifference) this.streamAliveAt = Date.now();
     this.rememberEntities((u as RawUpdate)._entities);
+    if (u instanceof Api.UpdatesTooLong) {
+      // The server's way of saying "too much happened, ask me": the official clients call getDifference here.
+      void this.catchUp("updatesTooLong");
+      return;
+    }
+    if (u instanceof Api.UpdateChannelTooLong) {
+      void this.channelCatchUp(channelKey(u.channelId), "channelTooLong");
+      return;
+    }
+    this.trackPts(u, { channelsOnly: !!opts.fromDifference });
 
     if (u instanceof Api.UpdateNewMessage || u instanceof Api.UpdateNewChannelMessage) {
       // Plain messages arrive through the NewMessage handler; it drops service messages, so take those here.
       if (u.message instanceof Api.MessageService) {
         const svc = u.message;
         await this.serial(() => this.processNew(svc));
+      } else if (opts.fromDifference && u.message instanceof Api.Message) {
+        await this.processMissed([u.message]);
       }
     } else if (u instanceof Api.UpdateEditMessage || u instanceof Api.UpdateEditChannelMessage) {
       await this.onEdit(u.message);

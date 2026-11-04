@@ -352,7 +352,15 @@ struct TelegramConversation: View {
                             .padding(.top, row.isFirstInGroup ? 6 : 2)
                     }
                 }
+                if let toast = session.botToast[chat.id] {
+                    VStack {
+                        TelegramToast(text: toast)
+                        Spacer()
+                    }
+                    .transition(.opacity)
+                }
             }
+            .animation(.easeInOut(duration: 0.2), value: session.botToast[chat.id])
             TelegramComposer(session: session, chat: chat)
                     .mentionSuggestions(session: session, chat: chat, accent: TG.accent)
         }
@@ -439,8 +447,13 @@ struct TelegramMessageRow: View {
                     }
                 }
                 if m.fromMe { replyButton(m); translateButton(m); reactButton(m) }
-                TelegramBubble(session: session, chat: chat, row: row)
-                    .messageContextMenu(session: session, message: m, reactions: ReactionSets.telegram)
+                VStack(alignment: m.fromMe ? .trailing : .leading, spacing: 4) {
+                    TelegramBubble(session: session, chat: chat, row: row)
+                        .messageContextMenu(session: session, message: m, reactions: ReactionSets.telegram)
+                    if let rows = m.buttons, !rows.isEmpty, !m.isDeleted {
+                        TelegramInlineKeyboard(session: session, message: m, rows: rows)
+                    }
+                }
                 if !m.fromMe { reactButton(m); translateButton(m); replyButton(m) }
                 if !m.fromMe { Spacer(minLength: ChatMetrics.gap(80, compact)) }
             }
@@ -682,13 +695,18 @@ struct TelegramComposer: View {
             TranslationNotice(session: session, chatId: chat.id)
             MathSendPreview(session: session, chatId: chat.id, accent: TG.accent)
             ComposerAttachments(session: session, chatId: chat.id, accent: TG.accent)
+            let botKeyboard = session.botKeyboard(chat.id)
+            let keyboardShown = botKeyboard != nil && !session.collapsedKeyboards.contains(chat.id)
+            let placeholder = (botKeyboard?.keyboard.placeholder).flatMap { $0.isEmpty ? nil : $0 }
+                ?? (session.replyingTo[chat.id]?.forceReply?.placeholder).flatMap { $0.isEmpty ? nil : $0 }
+                ?? (chat.kind == .channel ? "Broadcast a message…" : "Write a message…")
             HStack(alignment: .bottom, spacing: compact ? 10 : 14) {
                 if !collapsed {
                     Button { if let f = pickFile() { session.send(draft.wrappedValue, in: chat.id, filePath: f) } } label: {
                         TGIcon(name: "Icon_ChatAttach", fallback: "paperclip", size: 30).foregroundStyle(TG.secondary)
                     }.buttonStyle(.plain).padding(.bottom, 1)
                 }
-                ComposerTextView(text: draft, placeholder: chat.kind == .channel ? "Broadcast a message…" : "Write a message…",
+                ComposerTextView(text: draft, placeholder: placeholder,
                                  font: .systemFont(ofSize: 14), placeholderColor: NSColor(TG.secondary),
                                  maxHeight: compact ? 220 : 140,
                                  onSubmit: { session.send(draft.wrappedValue, in: chat.id) },
@@ -705,6 +723,13 @@ struct TelegramComposer: View {
                     TGIcon(name: "Icon_Entertainment_Emoji", fallback: "face.smiling", size: 30).foregroundStyle(TG.secondary)
                         .tool("Emoji") { Composer.emoji() }.padding(.bottom, 1)
                 }
+                if botKeyboard != nil && !collapsed {
+                    // Telegram's keyboard button: folds the bot's custom keyboard away and brings it back.
+                    Image(systemName: keyboardShown ? "keyboard.chevron.compact.down" : "keyboard")
+                        .font(.system(size: 20)).foregroundStyle(keyboardShown ? TG.accent : TG.secondary).frame(width: 30, height: 30)
+                        .tool(keyboardShown ? "Hide bot keyboard" : "Show bot keyboard") { session.toggleBotKeyboard(chat.id) }
+                        .padding(.bottom, 1)
+                }
                 if session.editing[chat.id] != nil {
                     Button { session.send(draft.wrappedValue, in: chat.id) } label: {
                         TGIcon(name: "Icon_SaveEditedMessage", fallback: "checkmark.circle.fill", size: 30).foregroundStyle(TG.accent)
@@ -719,8 +744,123 @@ struct TelegramComposer: View {
                 }
             }
             .padding(.horizontal, 16).padding(.vertical, 10)
+            if let kb = botKeyboard, keyboardShown {
+                TelegramBotKeyboardPanel(session: session, message: kb.message, keyboard: kb.keyboard, compact: compact)
+            }
         }
         .background(Color.white)
+    }
+}
+
+// MARK: Bot keyboards
+
+/// One button of a bot keyboard. Inline (under a bubble): white text on a translucent dark pill over the
+/// wallpaper, as Telegram draws them. Keyboard (under the composer): dark text on light grey.
+struct TelegramKeyButton: View {
+    enum Style { case inline, keyboard }
+    let button: BotButton
+    var style: Style = .inline
+    var busy = false
+    let action: () -> Void
+
+    var body: some View {
+        let inline = style == .inline
+        Button(action: action) {
+            HStack(spacing: 5) {
+                Text(button.text).font(.system(size: 13, weight: .medium)).lineLimit(1).truncationMode(.tail)
+                if busy { ProgressView().controlSize(.mini) }
+            }
+            .padding(.horizontal, 10).padding(.trailing, badge == nil ? 0 : 6)
+            .frame(maxWidth: .infinity).frame(height: inline ? 34 : 38)
+            .foregroundStyle(inline ? Color.white : Color(hex: 0x3E4B5B))
+            .background(RoundedRectangle(cornerRadius: 6).fill(inline ? Color.black.opacity(0.14) : Color(hex: 0xF1F3F5)))
+            .overlay(alignment: .topTrailing) {
+                if let badge {
+                    Image(systemName: badge).font(.system(size: 8, weight: .bold))
+                        .foregroundStyle(inline ? Color.white.opacity(0.85) : Color(hex: 0x3E4B5B).opacity(0.7)).padding(4)
+                }
+            }
+            .opacity(button.isSupported ? 1 : 0.55)
+            .contentShape(RoundedRectangle(cornerRadius: 6))
+        }
+        .buttonStyle(.plain)
+        .help(button.url ?? button.insert ?? button.text)
+    }
+
+    /// Telegram's corner glyph for buttons that leave the chat.
+    private var badge: String? {
+        switch button.kind {
+        case .url, .login: "arrow.up.right"
+        case .switchInline: "arrow.turn.up.right"
+        case .webApp: "rectangle.on.rectangle"
+        case .copy: "doc.on.doc"
+        default: nil
+        }
+    }
+}
+
+/// Inline keyboard under a bot's bubble.
+struct TelegramInlineKeyboard: View {
+    let session: PlatformSession
+    let message: Message
+    let rows: [[BotButton]]
+
+    var body: some View {
+        VStack(spacing: 4) {
+            ForEach(Array(rows.enumerated()), id: \.offset) { r, row in
+                HStack(spacing: 4) {
+                    ForEach(Array(row.enumerated()), id: \.offset) { c, b in
+                        TelegramKeyButton(button: b, busy: session.pressingButtons.contains("\(message.chatId)|\(message.id)|\(r)|\(c)")) {
+                            session.pressButton(b, row: r, column: c, in: message)
+                        }
+                    }
+                }
+            }
+        }
+        .frame(minWidth: 200, maxWidth: 480)
+    }
+}
+
+/// A bot's custom keyboard under the composer (Telegram's ReplyKeyboardMarkup); a press sends the label.
+struct TelegramBotKeyboardPanel: View {
+    let session: PlatformSession
+    let message: Message
+    let keyboard: ReplyKeyboard
+    var compact = false
+
+    var body: some View {
+        let rows = VStack(spacing: 6) {
+            ForEach(Array(keyboard.rows.enumerated()), id: \.offset) { r, row in
+                HStack(spacing: 6) {
+                    ForEach(Array(row.enumerated()), id: \.offset) { c, b in
+                        TelegramKeyButton(button: b, style: .keyboard) {
+                            session.pressButton(b, row: r, column: c, in: message, keyboard: keyboard)
+                        }
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, compact ? 10 : 16).padding(.bottom, 10)
+        VStack(spacing: 0) {
+            Rectangle().fill(TG.separator).frame(height: 1).padding(.bottom, 8)
+            if keyboard.rows.count > 4 {
+                ScrollView(.vertical) { rows }.frame(maxHeight: 4 * 44 + 10)
+            } else {
+                rows
+            }
+        }
+    }
+}
+
+/// A bot's answer to a pressed button (messages.getBotCallbackAnswer without `alert`), shown at the top of the chat.
+struct TelegramToast: View {
+    let text: String
+    var body: some View {
+        Text(text).font(.system(size: 13)).foregroundStyle(.white).multilineTextAlignment(.center).lineLimit(4)
+            .padding(.horizontal, 12).padding(.vertical, 8)
+            .background(RoundedRectangle(cornerRadius: 10).fill(Color.black.opacity(0.72)))
+            .frame(maxWidth: 360)
+            .padding(.top, 10)
     }
 }
 

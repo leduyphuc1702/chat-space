@@ -123,6 +123,51 @@ export interface MentionSpan {
   length: number;
 }
 
+/**
+ * What pressing a bot button does (capability "bot_buttons"). `callback`, `game` and `web_app` go through
+ * messages.clickButton; `url`, `login` and `user_profile` open `url`; `text` sends the label as a message;
+ * `switch_inline` puts `insert` into the composer; `copy` copies `copyText`; `unsupported` does nothing.
+ */
+export type ButtonKind =
+  | "callback"
+  | "url"
+  | "login"
+  | "switch_inline"
+  | "web_app"
+  | "game"
+  | "text"
+  | "copy"
+  | "user_profile"
+  | "unsupported";
+
+export interface Button {
+  text: string;
+  kind: ButtonKind;
+  /** url / login / user_profile / web_app: what to open (web_app: the bot's page, before the bridge adds auth data). */
+  url?: string;
+  /** switch_inline: "@bot query" ready to paste into the composer. */
+  insert?: string;
+  /** switch_inline: the bot asked for the query to be sent in this same chat. */
+  samePeer?: boolean;
+  /** copy: the text to put on the clipboard. */
+  copyText?: string;
+}
+
+/** A bot's custom keyboard shown in place of the composer's own (ReplyKeyboardMarkup). */
+export interface ReplyKeyboard {
+  rows: Button[][];
+  /** Fit the rows to their content instead of the usual keyboard height. */
+  resize?: boolean;
+  /** Hide after one button was pressed (the app may offer to show it again). */
+  oneTime?: boolean;
+  /** Keep it open even when the user hides it. */
+  persistent?: boolean;
+  /** Composer placeholder while the keyboard is active. */
+  placeholder?: string;
+  /** Meant only for the users the bot mentioned / replied to. */
+  selective?: boolean;
+}
+
 export interface Message {
   id: string;
   chatId: string;
@@ -140,6 +185,23 @@ export interface Message {
   deleted?: boolean;
   reactions?: Reaction[];
   status?: "pending" | "sent" | "delivered" | "read" | "failed";
+  /** Inline keyboard under the bubble (bots), rows of buttons. */
+  buttons?: Button[][];
+  /** This message installs a bot keyboard for the chat. */
+  replyKeyboard?: ReplyKeyboard;
+  /** This message removes the chat's bot keyboard (ReplyKeyboardHide). */
+  hideKeyboard?: boolean;
+  /** The bot asks for a reply to this message (ReplyKeyboardForceReply); `placeholder` goes in the composer. */
+  forceReply?: { placeholder?: string; oneTime?: boolean };
+}
+
+/** Result of messages.clickButton. */
+export interface ButtonAnswer {
+  /** What the bot answered (toast, or an alert when `alert` is set). */
+  message?: string;
+  alert?: boolean;
+  /** A page to open (games, web apps, callback answers with a URL). */
+  url?: string;
 }
 
 export type EventName =

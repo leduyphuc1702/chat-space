@@ -93,6 +93,19 @@ public sealed class PlatformSession : Observable
     /// In-chat search jumps here (message id per chat).
     private ImmutableDictionary<string, string> _scrollTarget = ImmutableDictionary<string, string>.Empty;
     public ImmutableDictionary<string, string> ScrollTarget { get => Get(ref _scrollTarget); set => Set(ref _scrollTarget, value); }
+    /// Bot keyboards put away after a one-time press, by the id of the message that installed them.
+    private ImmutableHashSet<string> _dismissedKeyboards = [];
+    public ImmutableHashSet<string> DismissedKeyboards { get => Get(ref _dismissedKeyboards); set => Set(ref _dismissedKeyboards, value); }
+    /// Chats whose bot keyboard is folded behind the composer's keyboard button.
+    private ImmutableHashSet<string> _collapsedKeyboards = [];
+    public ImmutableHashSet<string> CollapsedKeyboards { get => Get(ref _collapsedKeyboards); set => Set(ref _collapsedKeyboards, value); }
+    /// A bot's short answer to a pressed button, shown over the chat for a few seconds.
+    private ImmutableDictionary<string, string> _botToast = ImmutableDictionary<string, string>.Empty;
+    public ImmutableDictionary<string, string> BotToast { get => Get(ref _botToast); set => Set(ref _botToast, value); }
+    /// Buttons waiting for the bot's answer ("chatId|messageId|row|column").
+    private ImmutableHashSet<string> _pressingButtons = [];
+    public ImmutableHashSet<string> PressingButtons { get => Get(ref _pressingButtons); set => Set(ref _pressingButtons, value); }
+    private readonly Dictionary<string, CancellationTokenSource> _toastTimers = new();
 
     private BridgeProcess? _bridge;
     private readonly HashSet<string> _avatarRequested = new();
@@ -906,6 +919,106 @@ public sealed class PlatformSession : Observable
         if (i >= 0) Chats = Chats.SetItem(i, change(Chats[i]));
     }
 
+    // MARK: Bot buttons
+
+    /// The bot keyboard a chat shows under its composer: the newest incoming message that installed one, unless a
+    /// later message removed it (ReplyKeyboardHide) or the user put it away after a one-time press.
+    public (Message Message, ReplyKeyboard Keyboard)? BotKeyboard(string chatId)
+    {
+        if (!Can("bot_buttons") || !Messages.TryGetValue(chatId, out var list)) return null;
+        for (var i = list.Count - 1; i >= 0; i--)
+        {
+            var m = list[i];
+            if (m.HideKeyboard == true) return null;
+            if (m.ReplyKeyboard is { Rows.Count: > 0 } kb && !m.FromMe)
+                return DismissedKeyboards.Contains(m.Id) ? null : (m, kb);
+        }
+        return null;
+    }
+
+    /// A button of an inline keyboard (`keyboard` null) or of the chat's bot keyboard was pressed.
+    public void PressButton(BotButton button, int row, int column, Message message, ReplyKeyboard? keyboard = null)
+    {
+        var chatId = message.ChatId;
+        switch (button.Kind)
+        {
+            case ButtonKind.Text:
+                // A custom-keyboard button simply sends its label; one-time keyboards fold away after that.
+                if (keyboard?.OneTime == true) DismissedKeyboards = DismissedKeyboards.Add(message.Id);
+                Fire(async () =>
+                {
+                    try { await Post(button.Text, chatId); }
+                    catch (Exception e) { BridgeError = e.Message; }
+                });
+                break;
+            case ButtonKind.Url or ButtonKind.Login or ButtonKind.UserProfile:
+                if (button.Url is { Length: > 0 } url) KitShell.OpenUrl(url);
+                break;
+            case ButtonKind.Copy:
+                if (button.CopyText is not { } copy) return;
+                Clip.SetText(copy);
+                Toast("Text copied to clipboard", chatId);
+                break;
+            case ButtonKind.SwitchInline:
+                if (button.Insert is not { } insert) { Toast("This bot's inline mode is not available in ChatSpace", chatId); return; }
+                SetDraft(chatId, insert);
+                Avalonia.Threading.Dispatcher.UIThread.Post(ChatSpace.Composer.Focus);
+                break;
+            case ButtonKind.Unsupported:
+                Toast("This button needs the Telegram app", chatId);
+                break;
+            default: // Callback, Game, WebApp: the account answers the bot itself (messages.clickButton)
+                if (DemoData.Enabled) { Toast($"{message.SenderName ?? "Bot"}: {button.Text} ✓", chatId); return; }
+                var key = $"{chatId}|{message.Id}|{row}|{column}";
+                if (PressingButtons.Contains(key)) return;
+                PressingButtons = PressingButtons.Add(key);
+                Fire(async () =>
+                {
+                    try
+                    {
+                        var r = await Call("messages.clickButton", new JsonObject
+                        {
+                            ["chatId"] = chatId, ["messageId"] = message.Id, ["row"] = row, ["column"] = column,
+                        });
+                        if (r.Str("url") is { Length: > 0 } open) KitShell.OpenUrl(open);
+                        if (r.Str("message") is { Length: > 0 } text)
+                        {
+                            if (r.Bool("alert") == true) await Alert.Run(message.SenderName ?? "Telegram", text, [new Alert.Choice("OK", true)]);
+                            else Toast(text, chatId);
+                        }
+                    }
+                    catch (Exception e) { Toast(e.Message, chatId); }
+                    finally { PressingButtons = PressingButtons.Remove(key); }
+                });
+                break;
+        }
+    }
+
+    /// Shows a bot's answer (or a short notice) over the chat for a few seconds.
+    public void Toast(string text, string chatId)
+    {
+        BotToast = BotToast.SetItem(chatId, text);
+        if (_toastTimers.TryGetValue(chatId, out var old)) old.Cancel();
+        var cts = new CancellationTokenSource();
+        _toastTimers[chatId] = cts;
+        Fire(async () =>
+        {
+            await Task.Delay(4000, cts.Token);
+            if (!cts.IsCancellationRequested) BotToast = BotToast.Remove(chatId);
+        });
+    }
+
+    public void ToggleBotKeyboard(string chatId) =>
+        CollapsedKeyboards = CollapsedKeyboards.Contains(chatId) ? CollapsedKeyboards.Remove(chatId) : CollapsedKeyboards.Add(chatId);
+
+    /// The computer woke up or changed networks: the bridge checks its connection now and fetches what it missed
+    /// (`connection.resume`) instead of finding out at its next keep-alive. Bridges without it answer `unsupported`.
+    public void Resume()
+    {
+        if (_bridge == null || AuthState != AuthState.LoggedIn || DemoData.Enabled) return;
+        Fire(async () => { try { await Call("connection.resume"); } catch { } });
+    }
+
     public void MarkRead(string chatId)
     {
         Notifier.Shared.Clear(Platform, chatId);
@@ -1199,6 +1312,13 @@ public sealed class PlatformSession : Observable
                 {
                     Upsert(m);
                     ClearTyping(m.ChatId, m.SenderId);
+                    if (!m.FromMe)
+                    {
+                        // A new bot keyboard unfolds; a bot asking for a reply gets the composer set to it (as in Telegram).
+                        if (m.ReplyKeyboard != null) CollapsedKeyboards = CollapsedKeyboards.Remove(m.ChatId);
+                        if (m.ForceReply != null && data.Bool("live") == true && IsViewing(m.ChatId) && !ReplyingTo.ContainsKey(m.ChatId))
+                            ReplyingTo = ReplyingTo.SetItem(m.ChatId, m);
+                    }
                     if (m.FromMe || data.Bool("live") != true || !FirstSighting(m)) return;
                     var chat = Chats.FirstOrDefault(x => x.Id == m.ChatId);
                     if (IsViewing(m.ChatId)) MarkRead(m.ChatId);

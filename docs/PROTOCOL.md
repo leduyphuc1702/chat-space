@@ -116,6 +116,23 @@ interface Media {
   size?: number;          // bytes
 }
 
+// A bot button (capability `bot_buttons`, see [Bot buttons](#bot-buttons)).
+interface Button {
+  text: string;
+  kind: "callback" | "url" | "login" | "switch_inline" | "web_app" | "game" | "text" | "copy"
+      | "user_profile" | "unsupported";
+  url?: string;           // url / login / user_profile: what to open; web_app: the bot's page
+  insert?: string;        // switch_inline: "@bot query" for the composer
+  samePeer?: boolean;     // switch_inline: meant for this same chat
+  copyText?: string;      // copy: what goes on the clipboard
+}
+
+// A bot's custom keyboard shown in place of the usual composer keyboard (ReplyKeyboardMarkup).
+interface ReplyKeyboard {
+  rows: Button[][];
+  resize?: boolean; oneTime?: boolean; persistent?: boolean; placeholder?: string; selective?: boolean;
+}
+
 interface Message {
   id: string;
   chatId: string;
@@ -133,6 +150,10 @@ interface Message {
   deleted?: boolean;      // recalled / unsent
   reactions?: { emoji: string; count: number; fromMe: boolean }[];
   status?: "pending" | "sent" | "delivered" | "read" | "failed";  // only for fromMe
+  buttons?: Button[][];           // inline keyboard under the bubble (bots)
+  replyKeyboard?: ReplyKeyboard;  // this message installs a bot keyboard for the chat …
+  hideKeyboard?: boolean;         // … or removes it (ReplyKeyboardHide)
+  forceReply?: { placeholder?: string; oneTime?: boolean };  // the bot asks for a reply to this message
 }
 ```
 
@@ -161,6 +182,8 @@ interface Message {
 | `messages.edit` | `{ chatId, messageId, text, mentions? }` | `{ message: Message }` (capability `edit`, see [Editing](#editing)) |
 | `media.download` | `{ chatId, messageId }` | `{ path: string }` |
 | `typing.send` | `{ chatId, typing: boolean }` | `{}` |
+| `messages.clickButton` | `{ chatId, messageId, row: number, column: number }` | `{ message?: string, alert?: boolean, url?: string }` (capability `bot_buttons`, see [Bot buttons](#bot-buttons)) |
+| `connection.resume` | – | `{}` — the computer woke up or changed networks (see [Keeping up after a disconnect](#keeping-up-after-a-disconnect)) |
 | `chats.folders` | – | `{ folders: Folder[] }` (`[]` if the platform has none; capability `folders`) |
 | `storage.configure` | `StorageConfig` | `{}` |
 | `storage.usage` | – | `{ mediaBytes, mediaFiles, databaseBytes }` |
@@ -196,7 +219,52 @@ emits `auth.state {state:"logged_out", error:"qr_expired"}`; the app then calls 
 again automatically while the QR screen is visible.
 
 `capabilities` tells the UI which actions to show, e.g.
-`["reactions","reply","delete","edit","typing","read_receipts","media_send","voice","mentions","search"]`.
+`["reactions","reply","delete","edit","typing","read_receipts","media_send","voice","mentions","search","bot_buttons"]`.
+
+### Bot buttons
+
+Capability `bot_buttons` (Telegram) means messages carry their bot keyboards and the bridge implements
+`messages.clickButton`. An **inline keyboard** comes as `Message.buttons` (rows, drawn under the bubble); a **custom
+keyboard** as `Message.replyKeyboard` (drawn under the composer; the chat's current keyboard is the newest incoming
+message that set one, until a message with `hideKeyboard` removes it — the app keeps track). `forceReply` asks the
+app to put the composer into reply mode for that message. The app acts on a button by its `kind`:
+
+- `text` — send the label as a plain message (custom keyboards; a `oneTime` keyboard is folded away after that).
+- `url`, `login`, `user_profile` — open `url` (login buttons open the plain link; the Telegram login handshake is
+  not performed).
+- `switch_inline` — put `insert` (`@bot query`) into the composer; absent when the bot's username is unknown.
+- `copy` — put `copyText` on the clipboard.
+- `callback`, `game`, `web_app` — call `messages.clickButton` with the button's row/column; the bridge reads the
+  message again (bots edit their keyboards constantly), presses that button (`messages.getBotCallbackAnswer`, or
+  `messages.requestWebView` for web apps) and returns the bot's answer: `message` to show as a toast, or as an
+  alert when `alert` is set, and/or `url` to open (games, web apps). A button that is gone answers `not_found`;
+  a callback that requires the account's 2FA password answers `unsupported`.
+- `unsupported` — payments, sharing a phone number / location / poll / chat with the bot: shown dimmed, no action.
+
+The bot's reaction (an edited keyboard, a new message) arrives as the usual `message.update` / `message.new`.
+
+### Keeping up after a disconnect
+
+The platforms push messages over long-lived connections and keep little or nothing for a client that was away. What
+the official apps do when the computer wakes up or changes networks, bridges do too:
+
+- The app calls `connection.resume` on every bridge after a wake-from-sleep and after a network change (at most once
+  every few seconds). A bridge checks that its socket still answers (a ping with a short timeout) and reconnects at
+  once instead of waiting for the library's own keep-alive to fail (GramJS pings every 9 s, Baileys every 30 s plus
+  5 s grace, both followed by the bridge's reconnect backoff); a reconnect already waiting out its backoff is started
+  immediately. Bridges without the method answer `unsupported`, which the app ignores.
+- **Telegram** keeps the position in the update stream (`updates.getState`: pts/qts/date, plus one pts per channel)
+  in step with every update and in `DIR/updates-state.json`. On connect, after every reconnect, on `updatesTooLong`,
+  when an update's pts reveals a gap and on `connection.resume`, it calls `updates.getDifference`
+  (`updates.getChannelDifference` for a channel) and delivers what the server queued as `message.new` — `live` when
+  the message is fresh, so a message that arrived while the laptop was asleep still notifies, as in Telegram's own
+  apps — followed by `chat.upsert` with the exact unread counts (`messages.getPeerDialogs`). Past 500 pending
+  updates (`differenceTooLong`) it re-reads the chat list instead and announces every chat. Without this, GramJS
+  never asks for missed updates (its `catchUp` is a stub) and a message that arrived during a disconnect showed up
+  only when its chat was opened.
+- **WhatsApp** and **Zalo** servers replay what was missed on reconnect (offline messages, `requestOldMessages`);
+  only the reconnect itself had to be made fast. **Messenger** answers `{}`: messagix reconnects on its own and Meta
+  replays the missed tables.
 
 ### Muting
 

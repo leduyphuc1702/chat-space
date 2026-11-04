@@ -1,3 +1,4 @@
+import Network
 import AppKit
 import SwiftUI
 import UserNotifications
@@ -96,6 +97,41 @@ final class AppModel {
     func startAll() {
         for p in Platform.allCases { sessions[p]!.start() }
         observeDockBadge()
+        observeResumeTriggers()
+    }
+
+    @ObservationIgnored private var pathMonitor: NWPathMonitor?
+    @ObservationIgnored private var pathSeen = false
+    @ObservationIgnored private var lastResume = Date.distantPast
+
+    /// Waking from sleep and network changes: every bridge checks its socket and fetches what it missed at once
+    /// (`connection.resume`), instead of finding out at its next keep-alive, so new messages show up as quickly as
+    /// in the official apps when the lid opens.
+    private func observeResumeTriggers() {
+        _ = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { _ in
+            Task { @MainActor in AppModel.shared.resumeAll("wake") }
+        }
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { path in
+            let satisfied = path.status == .satisfied
+            Task { @MainActor in
+                let model = AppModel.shared
+                // The first report is the state at launch, not a change.
+                let first = !model.pathSeen
+                model.pathSeen = true
+                if satisfied && !first { model.resumeAll("network") }
+            }
+        }
+        monitor.start(queue: DispatchQueue.global(qos: .utility))
+        pathMonitor = monitor
+    }
+
+    /// A wake and the network coming back usually arrive together: one round per few seconds is enough.
+    func resumeAll(_ reason: String) {
+        let now = Date()
+        guard now.timeIntervalSince(lastResume) > 3 else { return }
+        lastResume = now
+        for s in sessions.values { s.resume() }
     }
 
     /// Sum of each platform's own icon-badge number.

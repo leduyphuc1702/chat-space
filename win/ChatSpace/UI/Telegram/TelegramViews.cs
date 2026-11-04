@@ -399,7 +399,8 @@ public sealed class TelegramConversation : Decorator, IFlexible
             return VStack(0,
                 View(() => Header(session, Current() ?? initial, compact)),
                 Rectangle().Fill(TG.Separator).Frame(height: 1),
-                ZStack(TelegramWallpaper.Make(), scroll).FillHeight(),
+                ZStack(TelegramWallpaper.Make(), scroll,
+                    View(() => session.BotToast.GetValueOrDefault(chatId) is { } toast ? VStack(0, TelegramToast.Make(toast), Spacer()) : null)).FillHeight(),
                 View(() => TelegramComposer.Make(session, Current() ?? initial, compact)
                     .WithMentionSuggestions(session, Current() ?? initial, TG.Accent)));
         });
@@ -530,8 +531,10 @@ public static class TelegramMessageRow
                     () => Active() && Translator.CanTranslate(m))
                 .PaddingBottom(2);
 
-        var bubble = TelegramBubble.Make(session, chat, row)
+        Control bubble = TelegramBubble.Make(session, chat, row)
             .MessageContextMenu(session, m, MenuLabels.English, ReactionSets.Telegram);
+        if (m.Buttons is { Count: > 0 } keys && !m.IsDeleted)
+            bubble = VStack(m.FromMe ? HAlign.Trailing : HAlign.Leading, 4, bubble, TelegramInlineKeyboard.Make(session, m, keys));
         return HStack(VAlign.Bottom, 6,
                 m.FromMe ? Spacer(ChatMetrics.Gap(80, compact)) : null,
                 !m.FromMe && chat.Kind == ChatKind.Group
@@ -724,7 +727,9 @@ public static class TelegramComposer
                 .PaddingH(16).PaddingTop(8);
         });
 
-        var editor = Composer.Editor(chat.Id, draft, chat.Kind == ChatKind.Channel ? "Broadcast a message…" : "Write a message…",
+        var placeholder = Tracker.Untracked(() => session.BotKeyboard(chat.Id)?.Keyboard.Placeholder) is { Length: > 0 } hint ? hint
+            : chat.Kind == ChatKind.Channel ? "Broadcast a message…" : "Write a message…";
+        var editor = Composer.Editor(chat.Id, draft, placeholder,
             onSubmit: () => session.Send(session.Draft(chat.Id), chat.Id),
             font: SFont.System(14), placeholderColor: TG.Secondary,
             maxHeight: compact ? 220 : 140,
@@ -752,6 +757,16 @@ public static class TelegramComposer
                 View(() => Collapsed() ? null
                     : TG.Icon("Icon_Entertainment_Emoji", "face.smiling", 30).Foreground(TG.Secondary)
                         .Tool("Emoji", Composer.Emoji).PaddingBottom(1)),
+                // Telegram's keyboard button: folds the bot's custom keyboard away and brings it back.
+                View(() =>
+                {
+                    if (Collapsed() || session.BotKeyboard(chat.Id) == null) return null;
+                    var shown = !session.CollapsedKeyboards.Contains(chat.Id);
+                    return Image(shown ? "keyboard.chevron.compact.down" : "keyboard").Font(20).Foreground(shown ? TG.Accent : TG.Secondary)
+                        .Frame(width: 30, height: 30)
+                        .Tool(shown ? "Hide bot keyboard" : "Show bot keyboard", () => session.ToggleBotKeyboard(chat.Id))
+                        .PaddingBottom(1);
+                }),
                 trailing)
             .PaddingH(16).PaddingV(10);
 
@@ -761,9 +776,106 @@ public static class TelegramComposer
                 TranslationNotice.Make(session, chat.Id),
                 MathSendPreview.Make(session, chat.Id, TG.Accent),
                 ComposerAttachments.Make(session, chat.Id, TG.Accent),
-                input)
+                input,
+                View(() => session.BotKeyboard(chat.Id) is { } kb && !session.CollapsedKeyboards.Contains(chat.Id)
+                    ? TelegramBotKeyboardPanel.Make(session, kb.Message, kb.Keyboard, compact)
+                    : null))
             .Background(SColor.White);
     }
+}
+
+// MARK: Bot keyboards
+
+/// One button of a bot keyboard. Inline (under a bubble): white text on a translucent dark pill over the wallpaper,
+/// as Telegram draws them. Keyboard (under the composer): dark text on light grey.
+public static class TelegramKeyButton
+{
+    public static Control Make(BotButton button, Action action, bool inline = true, Func<bool>? busy = null) => View(() =>
+    {
+        var fg = inline ? SColor.White : SColor.Hex(0x3E4B5B);
+        var badge = Badge(button.Kind);
+        Control label = Text(button.Text).Font(13, Weight.Medium).LineLimit(1)
+            .PaddingH(10).PaddingTrailing(badge == null ? 0 : 6)
+            .Frame(height: inline ? 34 : 38, alignment: Alignment.Center).FillWidth(Alignment.Center)
+            .Foreground(fg)
+            .Background(RoundedRectangle(6).Fill(inline ? SColor.Black.Opacity(0.14) : SColor.Hex(0xF1F3F5)));
+        if (badge != null)
+            label = label.Overlay(Alignment.TopTrailing, Image(badge).Font(8, Weight.Bold).Foreground(fg.Opacity(inline ? 0.85 : 0.7)).Padding(4));
+        var pressing = busy?.Invoke() ?? false;
+        return Button(action, label)
+            .Opacity(!button.IsSupported ? 0.55 : pressing ? 0.6 : 1)
+            .Help(button.Url ?? button.Insert ?? button.Text);
+    });
+
+    /// Telegram's corner glyph for buttons that leave the chat.
+    private static string? Badge(ButtonKind kind) => kind switch
+    {
+        ButtonKind.Url or ButtonKind.Login => "arrow.up.right",
+        ButtonKind.SwitchInline => "arrow.turn.up.right",
+        ButtonKind.WebApp => "rectangle.on.rectangle",
+        ButtonKind.Copy => "doc.on.doc",
+        _ => null,
+    };
+}
+
+/// Inline keyboard under a bot's bubble.
+public static class TelegramInlineKeyboard
+{
+    public static Control Make(PlatformSession session, Message m, IReadOnlyList<IReadOnlyList<BotButton>> rows)
+    {
+        var lines = new List<Control?>();
+        for (var r = 0; r < rows.Count; r++)
+        {
+            var cells = new List<Control?>();
+            for (var c = 0; c < rows[r].Count; c++)
+            {
+                var (ri, ci, b) = (r, c, rows[r][c]);
+                var key = $"{m.ChatId}|{m.Id}|{ri}|{ci}";
+                cells.Add(TelegramKeyButton.Make(b, () => session.PressButton(b, ri, ci, m), inline: true,
+                    busy: () => session.PressingButtons.Contains(key)));
+            }
+            lines.Add(HStack(4, cells.ToArray()));
+        }
+        return VStack(4, lines.ToArray()).Frame(minWidth: 200, maxWidth: 480);
+    }
+}
+
+/// A bot's custom keyboard under the composer (Telegram's ReplyKeyboardMarkup); a press sends the label.
+public static class TelegramBotKeyboardPanel
+{
+    public static Control Make(PlatformSession session, Message m, ReplyKeyboard keyboard, bool compact)
+    {
+        var lines = new List<Control?>();
+        for (var r = 0; r < keyboard.Rows.Count; r++)
+        {
+            var cells = new List<Control?>();
+            for (var c = 0; c < keyboard.Rows[r].Count; c++)
+            {
+                var (ri, ci, b) = (r, c, keyboard.Rows[r][c]);
+                cells.Add(TelegramKeyButton.Make(b, () => session.PressButton(b, ri, ci, m, keyboard), inline: false));
+            }
+            lines.Add(HStack(6, cells.ToArray()));
+        }
+        Control rows = VStack(6, lines.ToArray()).PaddingH(compact ? 10 : 16).PaddingBottom(10);
+        if (keyboard.Rows.Count > 4)
+            rows = new ScrollViewer
+            {
+                Content = rows,
+                HorizontalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Disabled,
+                MaxHeight = 4 * 44 + 10,
+            };
+        return VStack(0, Rectangle().Fill(TG.Separator).Frame(height: 1).PaddingBottom(8), rows);
+    }
+}
+
+/// A bot's answer to a pressed button (messages.getBotCallbackAnswer without `alert`), shown at the top of the chat.
+public static class TelegramToast
+{
+    public static Control Make(string text) =>
+        Text(text).Font(13).Foreground(SColor.White).MultilineAlignment(TextAlignment.Center).LineLimit(4)
+            .PaddingH(12).PaddingV(8)
+            .Background(RoundedRectangle(10).Fill(SColor.Black.Opacity(0.72)))
+            .Frame(maxWidth: 360).PaddingTop(10);
 }
 
 // MARK: Login

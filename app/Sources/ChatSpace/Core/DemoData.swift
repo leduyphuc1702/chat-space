@@ -186,6 +186,27 @@ enum DemoData {
             s.chats.append(Chat(id: vf, title: "VF - Đơn hàng ngày", kind: .group, unread: 0, timestamp: now - 63 * min,
                                 lastMessage: vfConv.last, memberCount: 11))
         }
+        if s.platform == .telegram {
+            // BotFather with an inline keyboard under its message and a custom keyboard under the composer.
+            s.capabilities.insert("bot_buttons")
+            var menu = msg("lt2b", "t2", "pt2", "BotFather", 895, "Choose a bot to change settings.")
+            menu.buttons = [
+                [BotButton(text: "@chatspace_demo_bot", kind: .callback)],
+                [BotButton(text: "Open docs", kind: .url, url: "https://core.telegram.org/bots"),
+                 BotButton(text: "Share", kind: .switchInline, insert: "@BotFather ")],
+                [BotButton(text: "Cancel", kind: .callback)],
+            ]
+            var keyboard = msg("lt2c", "t2", "pt2", "BotFather", 890, "What would you like to do?")
+            keyboard.replyKeyboard = ReplyKeyboard(
+                rows: [[BotButton(text: "/newbot", kind: .text), BotButton(text: "/mybots", kind: .text)],
+                       [BotButton(text: "/help", kind: .text), BotButton(text: "Share phone", kind: .unsupported)]],
+                resize: true, placeholder: "Send a command")
+            s.messages["t2"]?.append(contentsOf: [menu, keyboard])
+            if let i = s.chats.firstIndex(where: { $0.id == "t2" }) {
+                s.chats[i].lastMessage = keyboard
+                s.chats[i].timestamp = keyboard.timestamp
+            }
+        }
         s.chats.sort { ($0.isPinned ? 1 : 0, $0.timestamp) > ($1.isPinned ? 1 : 0, $1.timestamp) }
 
         if s.platform == .telegram {

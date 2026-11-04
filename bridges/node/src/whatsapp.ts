@@ -19,6 +19,7 @@ import {
   jidDecode,
   makeWASocket,
   proto,
+  S_WHATSAPP_NET,
   useMultiFileAuthState,
   type AnyMessageContent,
   type BaileysEventMap,
@@ -641,6 +642,44 @@ export class WhatsAppAdapter extends Adapter {
       // fallthrough: ordinary timeout
       default:
         this.scheduleReconnect(this.nextBackoff(), detail);
+    }
+  }
+
+  /**
+   * connection.resume: the computer woke up or changed networks. Baileys notices a dead socket only when a
+   * keep-alive goes unanswered (its 30 s interval plus 5 s), and our backoff comes on top; a ping that gets no answer
+   * within a few seconds settles it now, and a reconnect already waiting out its backoff is started at once. The
+   * server then delivers what it queued (offline messages), as after any reconnect.
+   */
+  async resume(): Promise<void> {
+    if (this.stopping || this.loggingOut || this.state === "awaiting_qr") return;
+    const sock = this.sock;
+    if (!sock || !this.open) {
+      if (this.reconnectTimer) {
+        this.ctx.log("whatsapp: resume, reconnecting now instead of after the backoff");
+        this.attempts = 0;
+        this.scheduleReconnect(0, "resume");
+      }
+      return;
+    }
+    try {
+      await sock.query(
+        {
+          tag: "iq",
+          attrs: { to: S_WHATSAPP_NET, type: "get", xmlns: "w:p", id: sock.generateMessageTag() },
+          content: [{ tag: "ping", attrs: {} }],
+        },
+        5000,
+      );
+    } catch {
+      if (this.sock !== sock || this.stopping) return;
+      this.ctx.log("whatsapp: no answer after resume, reconnecting");
+      this.attempts = 0; // the first retry then comes after about a second
+      // Same shape as Baileys' own keep-alive failure (a Boom with statusCode connectionLost), handled by onClose.
+      const lost = Object.assign(new Error("Connection was lost after resume"), {
+        output: { statusCode: DisconnectReason.connectionLost },
+      });
+      await sock.end(lost).catch(() => {});
     }
   }
 

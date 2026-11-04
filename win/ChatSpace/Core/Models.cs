@@ -192,6 +192,46 @@ public sealed record ReplyRef
 
 public enum DeliveryStatus { Pending, Sent, Delivered, Read, Failed }
 
+/// What pressing a bot button does (docs/PROTOCOL.md, capability `bot_buttons`); unknown kinds decode as Unsupported.
+public enum ButtonKind { Callback, Url, Login, SwitchInline, WebApp, Game, Text, Copy, UserProfile, Unsupported }
+
+/// One button of a bot's inline keyboard (`Message.Buttons`) or custom keyboard (`ReplyKeyboard.Rows`).
+public sealed record BotButton
+{
+    public string Text { get; init; } = "";
+    public ButtonKind Kind { get; init; }
+    /// Url / Login / UserProfile: what to open. WebApp: the bot's page (the bridge adds the launch data).
+    public string? Url { get; init; }
+    /// SwitchInline: "@bot query" to put into the composer.
+    public string? Insert { get; init; }
+    public bool? SamePeer { get; init; }
+    /// Copy: the text for the clipboard.
+    public string? CopyText { get; init; }
+
+    /// The account itself must answer the bot (messages.clickButton); the other kinds are handled in the app.
+    [JsonIgnore] public bool ViaBridge => Kind is ButtonKind.Callback or ButtonKind.Game or ButtonKind.WebApp;
+    [JsonIgnore] public bool IsSupported => Kind != ButtonKind.Unsupported;
+}
+
+/// A bot's custom keyboard shown under the composer (Telegram ReplyKeyboardMarkup).
+public sealed record ReplyKeyboard
+{
+    public IReadOnlyList<IReadOnlyList<BotButton>> Rows { get; init; } = [];
+    public bool? Resize { get; init; }
+    /// Hidden after one press; the keyboard button brings it back.
+    public bool? OneTime { get; init; }
+    public bool? Persistent { get; init; }
+    public string? Placeholder { get; init; }
+    public bool? Selective { get; init; }
+}
+
+/// The bot asks for a reply to its message (Telegram ReplyKeyboardForceReply).
+public sealed record ForceReply
+{
+    public string? Placeholder { get; init; }
+    public bool? OneTime { get; init; }
+}
+
 public sealed record Message
 {
     public string Id { get; init; } = "";
@@ -210,6 +250,12 @@ public sealed record Message
     public bool? Deleted { get; init; }
     public IReadOnlyList<Reaction>? Reactions { get; init; }
     public DeliveryStatus? Status { get; init; }
+    /// Inline keyboard under the bubble (bots): rows of buttons.
+    public IReadOnlyList<IReadOnlyList<BotButton>>? Buttons { get; init; }
+    /// This message installs a bot keyboard for the chat; `HideKeyboard` removes it.
+    public ReplyKeyboard? ReplyKeyboard { get; init; }
+    public bool? HideKeyboard { get; init; }
+    public ForceReply? ForceReply { get; init; }
 
     [JsonIgnore] public DateTime Date => Time.Local(Timestamp);
     [JsonIgnore] public bool IsDeleted => Deleted ?? false;

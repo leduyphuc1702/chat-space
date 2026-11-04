@@ -83,6 +83,49 @@ public sealed class AppModel : Observable
     {
         foreach (var p in Platforms.All) Sessions[p].Start();
         _badgeWatch = Watch.Effect(() => DockBadge.Show(DockBadgeCount));
+        ObserveResumeTriggers();
+    }
+
+    private DateTime _lastResume = DateTime.MinValue;
+
+    /// Waking from sleep and network changes: every bridge checks its socket and fetches what it missed at once
+    /// (`connection.resume`), instead of finding out at its next keep-alive, so new messages show up as quickly as
+    /// in the official apps after the computer comes back.
+    private void ObserveResumeTriggers()
+    {
+        try
+        {
+            System.Net.NetworkInformation.NetworkChange.NetworkAvailabilityChanged += (_, e) =>
+            {
+                if (e.IsAvailable) OnUiThread(() => ResumeAll("network"));
+            };
+            System.Net.NetworkInformation.NetworkChange.NetworkAddressChanged += (_, _) => OnUiThread(() => ResumeAll("address"));
+        }
+        catch { /* no network change notifications on this system */ }
+#if WINDOWS
+        if (OperatingSystem.IsWindows())
+        {
+            try
+            {
+                Microsoft.Win32.SystemEvents.PowerModeChanged += (_, e) =>
+                {
+                    if (e.Mode == Microsoft.Win32.PowerModes.Resume) OnUiThread(() => ResumeAll("wake"));
+                };
+            }
+            catch { /* no session (service / headless) */ }
+        }
+#endif
+    }
+
+    private static void OnUiThread(Action action) => Avalonia.Threading.Dispatcher.UIThread.Post(action);
+
+    /// A wake and the network coming back usually arrive together: one round per few seconds is enough.
+    public void ResumeAll(string reason)
+    {
+        var now = DateTime.UtcNow;
+        if ((now - _lastResume).TotalSeconds < 3) return;
+        _lastResume = now;
+        foreach (var s in Sessions.Values) s.Resume();
     }
 
     /// Sum of each platform's own icon-badge number.

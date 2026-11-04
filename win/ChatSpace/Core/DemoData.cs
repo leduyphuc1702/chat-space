@@ -197,6 +197,37 @@ public static class DemoData
             messages[vf] = vfConv;
             reached.Add(vf);
             chats.Add(new Chat { Id = vf, Title = "VF - Đơn hàng ngày", Kind = ChatKind.Group, Unread = 0, Timestamp = now - 63 * min, LastMessage = vfConv[^1], MemberCount = 11 });
+
+            // BotFather with an inline keyboard under its message and a custom keyboard under the composer.
+            caps.Add("bot_buttons");
+            var menu = Msg("lt2b", "t2", "pt2", "BotFather", 895, "Choose a bot to change settings.") with
+            {
+                Buttons =
+                [
+                    [new BotButton { Text = "@chatspace_demo_bot", Kind = ButtonKind.Callback }],
+                    [
+                        new BotButton { Text = "Open docs", Kind = ButtonKind.Url, Url = "https://core.telegram.org/bots" },
+                        new BotButton { Text = "Share", Kind = ButtonKind.SwitchInline, Insert = "@BotFather " },
+                    ],
+                    [new BotButton { Text = "Cancel", Kind = ButtonKind.Callback }],
+                ],
+            };
+            var keyboard = Msg("lt2c", "t2", "pt2", "BotFather", 890, "What would you like to do?") with
+            {
+                ReplyKeyboard = new ReplyKeyboard
+                {
+                    Rows =
+                    [
+                        [new BotButton { Text = "/newbot", Kind = ButtonKind.Text }, new BotButton { Text = "/mybots", Kind = ButtonKind.Text }],
+                        [new BotButton { Text = "/help", Kind = ButtonKind.Text }, new BotButton { Text = "Share phone", Kind = ButtonKind.Unsupported }],
+                    ],
+                    Resize = true,
+                    Placeholder = "Send a command",
+                },
+            };
+            messages["t2"] = messages["t2"].AddRange([menu, keyboard]);
+            var ti = chats.FindIndex(c => c.Id == "t2");
+            if (ti >= 0) chats[ti] = chats[ti] with { LastMessage = keyboard, Timestamp = keyboard.Timestamp };
         }
         s.Messages = messages.ToImmutableDictionary();
         s.ReachedStart = reached.ToImmutableHashSet();
