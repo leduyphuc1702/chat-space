@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -214,14 +215,20 @@ func (s *store) markDirty() {
 	})
 }
 
+// flush writes the store. The lock is held only while the records are copied
+// (milliseconds); the JSON encoding, which with 300 messages per thread can
+// take a second, runs without it, so incoming tables keep being applied and a
+// message arriving during a save is not held back.
 func (s *store) flush() error {
 	s.mu.RLock()
 	f := storeFile{Version: 1, Messages: make(map[string][]*storedMsg, len(s.msgs))}
 	for _, id := range sortedKeys(s.threads) {
-		f.Threads = append(f.Threads, s.threads[id])
+		t := *s.threads[id]
+		f.Threads = append(f.Threads, &t)
 	}
 	for _, id := range sortedKeys(s.contacts) {
-		f.Contacts = append(f.Contacts, s.contacts[id])
+		c := *s.contacts[id]
+		f.Contacts = append(f.Contacts, &c)
 	}
 	if len(s.members) > 0 {
 		f.Members = make(map[string][]string, len(s.members))
@@ -232,21 +239,36 @@ func (s *store) flush() error {
 	if len(s.pins) > 0 {
 		f.Pins = make(map[string][]pinRec, len(s.pins))
 		for chat, list := range s.pins {
-			f.Pins[chat] = list
+			f.Pins[chat] = slices.Clone(list)
 		}
 	}
 	for chat, list := range s.msgs {
 		if len(list) > maxPerThread {
 			list = list[len(list)-maxPerThread:]
 		}
-		f.Messages[chat] = list
+		cp := make([]*storedMsg, len(list))
+		for i, m := range list {
+			cp[i] = cloneStored(m)
+		}
+		f.Messages[chat] = cp
 	}
-	data, err := json.Marshal(&f)
 	s.mu.RUnlock()
+	data, err := json.Marshal(&f)
 	if err != nil {
 		return err
 	}
 	return atomicWrite(s.path, data, 0o600)
+}
+
+// cloneStored copies a message deeply enough that mutateMessage / putMessage
+// can change the original while the copy is being encoded.
+func cloneStored(m *storedMsg) *storedMsg {
+	cp := *m
+	cp.Message = snapshot(m)
+	if m.Actors != nil {
+		cp.Actors = maps.Clone(m.Actors)
+	}
+	return &cp
 }
 
 func (s *store) stopSaving() {

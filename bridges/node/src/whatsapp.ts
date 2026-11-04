@@ -781,7 +781,10 @@ export class WhatsAppAdapter extends Adapter {
       // and offline deliveries come as "append", so also require the message itself to be fresh.
       const live = up.type === "notify" && !msg.fromMe && msg.kind !== "system" && isFresh(msg.timestamp, now);
       if (!this.announced.has(chatId)) this.emitChatNow(chatId);
-      if (live) this.stopTyping(chatId, msg.senderId);
+      if (live) {
+        this.stopTyping(chatId, msg.senderId);
+        this.ctx.log(`whatsapp: live message ${msg.id} in ${chatId} delivered ${Date.now() - msg.timestamp} ms after its send time (second precision)`);
+      }
       this.ctx.emit("message.new", { message: msg, live });
       // Updated unread right behind every live message (the notification reads it from here).
       if (live) this.emitChatNow(chatId);

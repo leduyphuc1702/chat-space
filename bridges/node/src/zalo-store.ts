@@ -17,6 +17,9 @@ export const MAX_PER_CHAT = 300;
 const SAVE_DEBOUNCE_MS = 1500;
 const GZ_LEVEL = 6;
 const gzipAsync = promisify(gzip);
+const yieldLoop = () => new Promise<void>((r) => setImmediate(r));
+/** How long one stretch of serialisation may keep the event loop before letting messages through. */
+const SERIALIZE_SLICE_MS = 8;
 
 /**
  * Raw Zalo fields we must keep to act on a message later (quote, react, undo,
@@ -311,6 +314,29 @@ export class ZaloStore {
     return JSON.stringify({ ...this.data, messages });
   }
 
+  /**
+   * The same JSON as serialize(), built chat by chat with the event loop released every few milliseconds. With the
+   * whole history on disk (phone sync) a one-shot JSON.stringify of everything takes seconds, during which nothing
+   * is received or sent; this way a message arriving mid-write waits a few milliseconds at most. A chat changed
+   * while this runs is picked up by the next write (touch() marks the store dirty again).
+   */
+  async serializeChunked(): Promise<string> {
+    const { messages, ...rest } = this.data;
+    const head = JSON.stringify(rest); // "{…}" without the messages
+    const lim = this.persistMax && Number.isFinite(this.persistMax) ? this.persistMax : undefined;
+    const parts: string[] = [];
+    let sliceStart = performance.now();
+    for (const [id, list] of Object.entries(messages)) {
+      const kept = lim !== undefined && list.length > lim && trimmable(id) ? list.slice(-lim) : list;
+      parts.push(`${JSON.stringify(id)}:${JSON.stringify(kept)}`);
+      if (performance.now() - sliceStart > SERIALIZE_SLICE_MS) {
+        await yieldLoop();
+        sliceStart = performance.now();
+      }
+    }
+    return `${head.slice(0, -1)}${head.length > 2 ? "," : ""}"messages":{${parts.join(",")}}}`;
+  }
+
   /** Snapshot now, compress on a worker thread, then swap the file in one synchronous step. */
   private async writeOnce() {
     if (!this.isDirty) return;
@@ -320,7 +346,7 @@ export class ZaloStore {
     const epoch = this.epoch;
     const tmp = this.gzFile + ".tmp";
     try {
-      const gz = await gzipAsync(this.serialize(), { level: GZ_LEVEL });
+      const gz = await gzipAsync(await this.serializeChunked(), { level: GZ_LEVEL });
       await writeFile(tmp, gz);
       // reset() or a synchronous flush() overtook us while we were writing: our snapshot is stale.
       if (epoch !== this.epoch || seq !== this.seq) {

@@ -325,38 +325,46 @@ export class WAStore {
     if (gzPath.endsWith(".gz")) rmSync(gzPath.slice(0, -3), { force: true });
   }
 
-  private snapshot() {
-    const files: [string, string][] = [];
+  /** JSON of one chat's messages as kept on disk (never more than the configured limit). */
+  private chatJson(id: string): string {
     const lim = this.persistMax;
-    for (const id of this.dirtyChats) {
-      // The disk copy never keeps more than the configured limit, even if paging back loaded more into memory.
-      let list = this.msgs.get(id) ?? [];
-      if (lim && Number.isFinite(lim) && list.length > lim) list = list.slice(-lim);
-      files.push([this.msgPath(id), JSON.stringify(list, BufferJSON.replacer)]);
-    }
+    // The disk copy never keeps more than the configured limit, even if paging back loaded more into memory.
+    let list = this.msgs.get(id) ?? [];
+    if (lim && Number.isFinite(lim) && list.length > lim) list = list.slice(-lim);
+    return JSON.stringify(list, BufferJSON.replacer);
+  }
+
+  private indexJson(): string {
+    return JSON.stringify({
+      v: STORE_VERSION,
+      accountId: this.accountId,
+      accountName: this.accountName,
+      chats: [...this.chats.values()],
+      contacts: [...this.contacts.values()],
+      lid2pn: [...this.lid2pn],
+      groups: [...this.groups],
+      pins: [...this.pins],
+    });
+  }
+
+  /** Takes (and clears) what the next write has to cover. */
+  private takeDirty() {
+    const chats = [...this.dirtyChats];
     this.dirtyChats.clear();
     const removed = [...this.removedFiles];
     this.removedFiles.clear();
-    let index: string | undefined;
-    if (this.dirtyIndex) {
-      this.dirtyIndex = false;
-      index = JSON.stringify({
-        v: STORE_VERSION,
-        accountId: this.accountId,
-        accountName: this.accountName,
-        chats: [...this.chats.values()],
-        contacts: [...this.contacts.values()],
-        lid2pn: [...this.lid2pn],
-        groups: [...this.groups],
-        pins: [...this.pins],
-      });
-    }
-    return { files, removed, index };
+    const index = this.dirtyIndex;
+    this.dirtyIndex = false;
+    return { chats, removed, index };
   }
 
+  /**
+   * One chat at a time: each chat is stringified right before its (worker-thread) compression, so the event loop is
+   * free between chats and a message arriving mid-write waits for one chat's JSON at most, not for every dirty chat.
+   */
   private async writeAsync() {
     const epoch = this.epoch;
-    const { files, removed, index } = this.snapshot();
+    const { chats, removed, index } = this.takeDirty();
     for (const f of removed) this.rmBoth(f);
     const put = async (path: string, text: string) => {
       const gz = await gzipAsync(text, { level: GZ_LEVEL }); // on a worker thread: no event-loop stall
@@ -370,8 +378,11 @@ export class WAStore {
       if (path.endsWith(".gz")) rmSync(path.slice(0, -3), { force: true });
       return true;
     };
-    for (const [path, data] of files) if (!(await put(path, data))) return;
-    if (index) await put(this.indexGz, index);
+    for (const id of chats) {
+      if (epoch !== this.epoch) return;
+      if (!(await put(this.msgPath(id), this.chatJson(id)))) return;
+    }
+    if (index) await put(this.indexGz, this.indexJson());
   }
 
   /** Synchronous flush for shutdown (await idle() first so no asynchronous write is still running). */
@@ -381,15 +392,15 @@ export class WAStore {
       this.timer = undefined;
     }
     try {
-      const { files, removed, index } = this.snapshot();
+      const { chats, removed, index } = this.takeDirty();
       for (const f of removed) this.rmBoth(f);
       const put = (path: string, text: string) => {
         writeFileSync(path + ".tmp", gzipSync(text, { level: GZ_LEVEL }));
         renameSync(path + ".tmp", path);
         if (path.endsWith(".gz")) rmSync(path.slice(0, -3), { force: true });
       };
-      for (const [path, data] of files) put(path, data);
-      if (index) put(this.indexGz, index);
+      for (const id of chats) put(this.msgPath(id), this.chatJson(id));
+      if (index) put(this.indexGz, this.indexJson());
     } catch (e) {
       this.log("whatsapp store flush failed", String(e));
     }

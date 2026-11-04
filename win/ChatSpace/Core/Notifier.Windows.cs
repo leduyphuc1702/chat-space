@@ -46,8 +46,11 @@ public sealed partial class Notifier
         string? logo = null;
         if (avatar is { Length: > 0 })
         {
-            var load = AvatarFile(avatar, group);
-            if (await Task.WhenAny(load, Task.Delay(1500)) == load) logo = load.Result;
+            // The toast goes out at once. The avatar is attached only when it is already decoded: fetching it first
+            // (Zalo and Messenger avatars are URLs) held the toast back for up to 1.5 s. The fetch started here has it
+            // ready for the next toast of this chat.
+            if (ImageLoader.Shared.Cached(avatar, 256) != null) logo = await AvatarFile(avatar, group);
+            else _ = ImageLoader.Shared.Load(avatar, 256);
         }
         try
         {

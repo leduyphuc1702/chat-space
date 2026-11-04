@@ -2817,6 +2817,7 @@ export class TelegramAdapter extends Adapter {
 
     // The app needs the chat (title, avatar, mute) before the first message.new of a chat it has not seen.
     const fresh = await this.ensureChat(msg);
+    if (live) this.ctx.log(`telegram: live message ${msg.id} in ${msg.chatId} delivered ${Date.now() - msg.timestamp} ms after its send time (second precision)`);
     this.ctx.emit("message.new", { message: msg, live });
     this.bumpChat(msg, { duplicate, fresh });
   }

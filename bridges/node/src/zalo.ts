@@ -1818,6 +1818,21 @@ export class ZaloAdapter extends Adapter {
 
   // ===================================================================== incoming messages
 
+  private resolveStickerLater(chatId: string, msgId: string, stickerId: number) {
+    void this.resolveSticker(stickerId)
+      .then((media) => {
+        if (!media) return;
+        const e = this.store.find(chatId, msgId);
+        if (!e || e.m.media?.url) return;
+        e.m.media = { ...media, path: e.m.media?.path };
+        e.m.text = undefined;
+        this.store.touch();
+        this.ctx.emit("message.update", { message: e.m });
+        this.scheduleUpsert(chatId);
+      })
+      .catch(() => {});
+  }
+
   private async resolveSticker(id: number): Promise<Media | undefined> {
     if (this.stickerCache.has(id)) return this.stickerCache.get(id);
     const api = this.api;
@@ -1847,12 +1862,19 @@ export class ZaloAdapter extends Adapter {
     const msgType = str(d.msgType);
     const mapped = mapContent(msgType, d.content);
     let { text, media } = mapped;
-    if (mapped.sticker) {
-      media = await this.resolveSticker(mapped.sticker.id);
-      text = media?.url ? undefined : "[Sticker]";
-    }
     const gid = str(d.msgId);
     const id = gid && gid !== "0" ? gid : str(d.cliMsgId);
+    if (mapped.sticker) {
+      if (this.stickerCache.has(mapped.sticker.id)) {
+        media = this.stickerCache.get(mapped.sticker.id);
+      } else {
+        // Sticker art is fetched off the ingest queue: a slow sticker API (up to 5 s) must not hold back the
+        // messages behind this one. The message shows up now and gets its image with a message.update.
+        media = undefined;
+        this.resolveStickerLater(chatId, id, mapped.sticker.id);
+      }
+      text = media?.url ? undefined : "[Sticker]";
+    }
     if (!fromMe) this.remember(uidFrom, nonEmpty(d.dName));
     const senderName = fromMe ? this.self?.name : (this.nameOf(uidFrom) ?? nonEmpty(d.dName));
     const m: Message = {
@@ -1931,7 +1953,10 @@ export class ZaloAdapter extends Adapter {
       const live = !opts.replay && !m.fromMe && m.kind !== "system" && isFresh(m.timestamp);
       // The app needs the chat (title, avatar, mute) before the first message.new of a chat it has not seen.
       if (!this.announced.has(chatId)) this.emitChatNow(chatId);
-      if (live) this.stopTyping(chatId, m.senderId);
+      if (live) {
+        this.stopTyping(chatId, m.senderId);
+        this.log(`live message ${m.id} in ${chatId} delivered ${Date.now() - m.timestamp} ms after its send time`);
+      }
       this.ctx.emit("message.new", { message: m, live });
       // Updated unread right behind every live message (the notification reads it from here).
       if (live) {

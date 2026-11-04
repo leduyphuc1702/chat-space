@@ -81,9 +81,17 @@ final class Notifier {
             content.sound = .default
         }
         let id = "\(Self.threadID(p, m.chatId))|\(m.id)"
-        let avatar = chat?.avatar ?? m.senderAvatar
+        // The banner goes out at once. The avatar is attached only when it is already decoded: fetching it first
+        // (Zalo and Messenger avatars are URLs) held the banner back for up to 1.5 s, and the official apps do not
+        // wait either. The fetch started here has it ready for the next banner of this chat.
+        if let avatar = chat?.avatar ?? m.senderAvatar, !avatar.isEmpty {
+            if let img = ImageLoader.shared.cached(avatar), let att = Self.avatarAttachment(img, id: id) {
+                content.attachments = [att]
+            } else {
+                Task { _ = await ImageLoader.shared.load(avatar) }
+            }
+        }
         Task {
-            if let att = await Self.avatarAttachment(avatar, id: id) { content.attachments = [att] }
             try? await UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: id, content: content, trigger: nil))
         }
     }
@@ -171,19 +179,8 @@ final class Notifier {
     // MARK: Avatar
 
     /// Circular avatar thumbnail, as the official apps attach to their banners.
-    private static func avatarAttachment(_ source: String?, id: String) async -> UNNotificationAttachment? {
-        guard let source, !source.isEmpty else { return nil }
-        let png: Data? = await withTaskGroup(of: Data?.self) { group in
-            group.addTask { @MainActor in
-                guard let img = await ImageLoader.shared.load(source) else { return nil }
-                return circularPNG(img, side: 128)
-            }
-            group.addTask { try? await Task.sleep(nanoseconds: 1_500_000_000); return nil }
-            let first = await group.next() ?? nil
-            group.cancelAll()
-            return first
-        }
-        guard let png else { return nil }
+    private static func avatarAttachment(_ image: NSImage, id: String) -> UNNotificationAttachment? {
+        guard let png = circularPNG(image, side: 128) else { return nil }
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("ChatSpaceNotifications", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let url = dir.appendingPathComponent("\(abs(id.hashValue)).png")
