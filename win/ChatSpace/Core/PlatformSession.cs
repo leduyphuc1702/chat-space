@@ -942,7 +942,7 @@ public sealed class PlatformSession : Observable
         var chatId = message.ChatId;
         switch (button.Kind)
         {
-            case ButtonKind.Text:
+            case BotButtonKind.Text:
                 // A custom-keyboard button simply sends its label; one-time keyboards fold away after that.
                 if (keyboard?.OneTime == true) DismissedKeyboards = DismissedKeyboards.Add(message.Id);
                 Fire(async () =>
@@ -951,20 +951,20 @@ public sealed class PlatformSession : Observable
                     catch (Exception e) { BridgeError = e.Message; }
                 });
                 break;
-            case ButtonKind.Url or ButtonKind.Login or ButtonKind.UserProfile:
+            case BotButtonKind.Url or BotButtonKind.Login or BotButtonKind.UserProfile:
                 if (button.Url is { Length: > 0 } url) KitShell.OpenUrl(url);
                 break;
-            case ButtonKind.Copy:
+            case BotButtonKind.Copy:
                 if (button.CopyText is not { } copy) return;
                 Clip.SetText(copy);
                 Toast("Text copied to clipboard", chatId);
                 break;
-            case ButtonKind.SwitchInline:
+            case BotButtonKind.SwitchInline:
                 if (button.Insert is not { } insert) { Toast("This bot's inline mode is not available in ChatSpace", chatId); return; }
                 SetDraft(chatId, insert);
                 Avalonia.Threading.Dispatcher.UIThread.Post(ChatSpace.Composer.Focus);
                 break;
-            case ButtonKind.Unsupported:
+            case BotButtonKind.Unsupported:
                 Toast("This button needs the Telegram app", chatId);
                 break;
             default: // Callback, Game, WebApp: the account answers the bot itself (messages.clickButton)

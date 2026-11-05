@@ -204,12 +204,12 @@ public static class DemoData
             {
                 Buttons =
                 [
-                    [new BotButton { Text = "@chatspace_demo_bot", Kind = ButtonKind.Callback }],
+                    [new BotButton { Text = "@chatspace_demo_bot", Kind = BotButtonKind.Callback }],
                     [
-                        new BotButton { Text = "Open docs", Kind = ButtonKind.Url, Url = "https://core.telegram.org/bots" },
-                        new BotButton { Text = "Share", Kind = ButtonKind.SwitchInline, Insert = "@BotFather " },
+                        new BotButton { Text = "Open docs", Kind = BotButtonKind.Url, Url = "https://core.telegram.org/bots" },
+                        new BotButton { Text = "Share", Kind = BotButtonKind.SwitchInline, Insert = "@BotFather " },
                     ],
-                    [new BotButton { Text = "Cancel", Kind = ButtonKind.Callback }],
+                    [new BotButton { Text = "Cancel", Kind = BotButtonKind.Callback }],
                 ],
             };
             var keyboard = Msg("lt2c", "t2", "pt2", "BotFather", 890, "What would you like to do?") with
@@ -218,8 +218,8 @@ public static class DemoData
                 {
                     Rows =
                     [
-                        [new BotButton { Text = "/newbot", Kind = ButtonKind.Text }, new BotButton { Text = "/mybots", Kind = ButtonKind.Text }],
-                        [new BotButton { Text = "/help", Kind = ButtonKind.Text }, new BotButton { Text = "Share phone", Kind = ButtonKind.Unsupported }],
+                        [new BotButton { Text = "/newbot", Kind = BotButtonKind.Text }, new BotButton { Text = "/mybots", Kind = BotButtonKind.Text }],
+                        [new BotButton { Text = "/help", Kind = BotButtonKind.Text }, new BotButton { Text = "Share phone", Kind = BotButtonKind.Unsupported }],
                     ],
                     Resize = true,
                     Placeholder = "Send a command",

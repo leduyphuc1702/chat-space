@@ -808,12 +808,12 @@ public static class TelegramKeyButton
     });
 
     /// Telegram's corner glyph for buttons that leave the chat.
-    private static string? Badge(ButtonKind kind) => kind switch
+    private static string? Badge(BotButtonKind kind) => kind switch
     {
-        ButtonKind.Url or ButtonKind.Login => "arrow.up.right",
-        ButtonKind.SwitchInline => "arrow.turn.up.right",
-        ButtonKind.WebApp => "rectangle.on.rectangle",
-        ButtonKind.Copy => "doc.on.doc",
+        BotButtonKind.Url or BotButtonKind.Login => "arrow.up.right",
+        BotButtonKind.SwitchInline => "arrow.turn.up.right",
+        BotButtonKind.WebApp => "rectangle.on.rectangle",
+        BotButtonKind.Copy => "doc.on.doc",
         _ => null,
     };
 }
