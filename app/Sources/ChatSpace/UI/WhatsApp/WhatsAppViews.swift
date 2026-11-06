@@ -366,8 +366,9 @@ struct WhatsAppConversation: View {
                         if row.showDayHeader {
                             WhatsAppSystemChip(text: WA.dayTitle(row.message.date)).padding(.vertical, 8)
                         }
+                        if let n = row.unreadDivider { UnreadDivider(platform: .whatsapp, count: n) }
                         WhatsAppMessageRow(session: session, chat: chat, row: row)
-                            .revealHighlight(session, chatId: chat.id, id: row.id)
+                            .revealHighlight(session, chatId: chat.id, row: row)
                             .padding(.top, row.isFirstInGroup ? 10 : 2)
                     }
                 }
@@ -439,12 +440,26 @@ struct WhatsAppMessageRow: View {
         if m.kind == .system {
             WhatsAppSystemChip(text: m.text ?? "").padding(.vertical, 4)
         } else {
-            HStack(spacing: 8) {
+            HStack(alignment: .top, spacing: 8) {
                 if m.fromMe { Spacer(minLength: ChatMetrics.gap(120, compact)) }
-                if m.fromMe { translateButton(m); reactButton(m) }
+                if !m.fromMe && chat.isGroup {
+                    if row.isFirstInGroup {
+                        AvatarView(source: m.senderAvatar, size: 28) {
+                            Circle().fill(Color(hex: 0xDFE5E7))
+                                .overlay(Image(systemName: "person.fill").font(.system(size: 14)).foregroundStyle(.white))
+                        }
+                        .memberProfile(session: session, chat: chat, message: m)
+                    } else {
+                        Color.clear.frame(width: 28, height: 1)
+                    }
+                }
                 WhatsAppBubble(session: session, chat: chat, row: row, picking: $picking)
                     .messageContextMenu(session: session, message: m, labels: .vietnamese, reactions: ReactionSets.whatsApp)
-                if !m.fromMe { reactButton(m); translateButton(m) }
+                    .besideBubble(fromMe: m.fromMe, spacing: 8, vertical: .center) {
+                        HStack(spacing: 6) {
+                            if m.fromMe { translateButton(m); reactButton(m) } else { reactButton(m); translateButton(m) }
+                        }
+                    }
                 if !m.fromMe { Spacer(minLength: ChatMetrics.gap(120, compact)) }
             }
             .padding(.horizontal, compact ? 12 : 60)
@@ -452,7 +467,7 @@ struct WhatsAppMessageRow: View {
         }
     }
 
-    /// WhatsApp's grey smiley beside a hovered bubble; the slot is kept so bubbles don't shift.
+    /// WhatsApp's grey smiley beside a hovered bubble, floating in the margin.
     @ViewBuilder
     private func reactButton(_ m: Message) -> some View {
         let show = (hovered || picking) && !m.isDeleted && session.can("reactions")
@@ -484,8 +499,9 @@ struct WhatsAppBubble: View {
     private var m: Message { row.message }
 
     var body: some View {
-        let mediaOnly = (m.kind == .image || m.kind == .video || m.kind == .gif) && (m.text ?? "").isEmpty
-        let isSticker = m.kind == .sticker || (m.kind == .text && isJumboEmoji(m.text))
+        let mediaOnly = row.album != nil ? row.albumCaption == nil && row.albumOthers.isEmpty
+            : (m.kind == .image || m.kind == .video || m.kind == .gif) && (m.text ?? "").isEmpty
+        let isSticker = row.album == nil && (m.kind == .sticker || (m.kind == .text && isJumboEmoji(m.text)))
         let fill = m.fromMe ? WA.outBubble : WA.inBubble
 
         Group {
@@ -501,6 +517,7 @@ struct WhatsAppBubble: View {
                     if !m.fromMe && chat.isGroup && row.isFirstInGroup {
                         Text(m.senderName ?? "").font(.system(size: 12.8, weight: .semibold)).foregroundStyle(WA.nameColor(m.senderId))
                             .padding(.horizontal, mediaOnly ? 4 : 0)
+                            .memberProfile(session: session, chat: chat, message: m)
                     }
                     if m.forwarded == true {
                         Label("Đã chuyển tiếp", systemImage: "arrowshape.turn.up.right").font(.system(size: 12.5).italic()).foregroundStyle(WA.secondary)
@@ -556,6 +573,28 @@ struct WhatsAppBubble: View {
                 meta.padding(.leading, 6)
             }
             .font(.system(size: 14)).foregroundStyle(WA.secondary)
+        } else if row.album != nil {
+            VStack(alignment: .leading, spacing: 4) {
+                if !row.albumMedia.isEmpty {
+                    AlbumGrid(session: session, items: row.albumMedia, width: 330, spacing: 3, cornerRadius: 6)
+                        .overlay(alignment: .bottomTrailing) {
+                            if mediaOnly {
+                                meta.environment(\.colorScheme, .dark).foregroundStyle(.white)
+                                    .padding(.horizontal, 6).padding(.vertical, 3)
+                                    .background(LinearGradient(colors: [.clear, .black.opacity(0.35)], startPoint: .top, endPoint: .bottom))
+                                    .padding(4)
+                            }
+                        }
+                }
+                ForEach(row.albumOthers) { f in
+                    FileContent(session: session, message: f, iconColor: Color(hex: 0x8696A0), titleColor: WA.text, subtitleColor: WA.secondary)
+                        .padding(8)
+                        .background(RoundedRectangle(cornerRadius: 6).fill(Color.black.opacity(0.04)))
+                }
+                if !mediaOnly {
+                    if row.albumCaption != nil { textWithMeta.padding(.horizontal, 2) } else { HStack { Spacer(); meta } }
+                }
+            }
         } else {
             switch m.kind {
             case .image, .video, .gif:
@@ -579,6 +618,11 @@ struct WhatsAppBubble: View {
                         .background(RoundedRectangle(cornerRadius: 6).fill(Color.black.opacity(0.04)))
                     HStack { Spacer(); meta }
                 }
+            case .call:
+                HStack(alignment: .bottom, spacing: 12) {
+                    CallContent(message: m, titleColor: WA.text, subtitleColor: WA.secondary)
+                    meta
+                }
             default:
                 textWithMeta
             }
@@ -586,12 +630,10 @@ struct WhatsAppBubble: View {
     }
 
     private var textWithMeta: some View {
-        let reserve = Text("    " + (m.isEdited ? "Đã chỉnh sửa " : "") + Fmt.time(m.date) + (m.fromMe ? "  ✓✓" : ""))
-            .font(.system(size: 11)).foregroundColor(.clear)
+        let reserve = "    " + (m.isEdited ? "Đã chỉnh sửa " : "") + Fmt.time(m.date) + (m.fromMe ? "  ✓✓" : "")
         return ZStack(alignment: .bottomTrailing) {
-            (Text(linkified(m.text ?? "", linkColor: Color(hex: 0x027EB5))) + reserve)
-                .font(.system(size: 14.2)).foregroundStyle(WA.text).textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
+            BodyText(text: m.text ?? "", links: m.links, font: .system(size: 14.2), nsFont: .systemFont(ofSize: 14.2),
+                     color: WA.text, linkColor: Color(hex: 0x027EB5), reserve: reserve, reserveSize: 11)
             meta.offset(y: 3)
         }
     }
@@ -670,6 +712,7 @@ struct WhatsAppComposer: View {
                         Image(systemName: "xmark").foregroundStyle(WA.icon).padding(10)
                     }.buttonStyle(.plain)
                 }
+                .fixedSize(horizontal: false, vertical: true)
                 .background(RoundedRectangle(cornerRadius: 7).fill(Color(hex: 0xF0F2F5)))
                 .clipShape(RoundedRectangle(cornerRadius: 7))
                 .padding(.horizontal, 60).padding(.top, 8)

@@ -16,16 +16,19 @@ import (
 type searchParams struct {
 	query  string
 	chatID string
-	kinds  map[string]bool
-	before int64
-	limit  int
+	// senderID keeps only the messages of one sender (the profile panel's media, files and
+	// links of a member); alone it lists everything that member wrote.
+	senderID string
+	kinds    map[string]bool
+	before   int64
+	limit    int
 }
 
 var searchKinds = map[string]bool{"text": true, "image": true, "video": true, "audio": true, "voice": true,
 	"file": true, "sticker": true, "gif": true, "location": true, "contact": true, "link": true}
 
 func parseSearch(p params) (searchParams, error) {
-	sp := searchParams{query: strings.TrimSpace(p.str("query")), chatID: p.str("chatId"), limit: min(p.intOr("limit", 50), 200)}
+	sp := searchParams{query: strings.TrimSpace(p.str("query")), chatID: p.str("chatId"), senderID: p.str("senderId"), limit: min(p.intOr("limit", 50), 200)}
 	var kinds []string
 	if raw, ok := p["kinds"]; ok {
 		_ = json.Unmarshal(raw, &kinds)
@@ -38,8 +41,8 @@ func parseSearch(p params) (searchParams, error) {
 			sp.kinds[k] = true
 		}
 	}
-	if sp.query == "" && sp.kinds == nil {
-		return sp, newErr(codeInvalidParams, "query or kinds required")
+	if sp.query == "" && sp.kinds == nil && sp.senderID == "" {
+		return sp, newErr(codeInvalidParams, "query, kinds or senderId required")
 	}
 	if raw, ok := p["before"]; ok {
 		var f float64
@@ -70,7 +73,7 @@ func (sp searchParams) kindMatches(m *storedMsg) bool {
 	if sp.kinds[m.Kind] {
 		return true
 	}
-	return sp.kinds["link"] && urlRe.MatchString(m.Text)
+	return sp.kinds["link"] && (urlRe.MatchString(m.Text) || len(m.Links) > 0)
 }
 
 // searchMessages scans the local store only, newest first: searching must never
@@ -90,12 +93,20 @@ func (s *store) searchMessages(sp searchParams) []Message {
 			if m.Deleted || !sp.kindMatches(m) || (sp.before > 0 && m.Timestamp >= sp.before) {
 				continue
 			}
-			hay := m.Text
-			if m.Media != nil && m.Media.FileName != "" {
-				hay += "\n" + m.Media.FileName
-			}
-			if !containsAll(fold(hay), words) {
+			if sp.senderID != "" && m.SenderID != sp.senderID {
 				continue
+			}
+			if len(words) > 0 {
+				hay := m.Text
+				if m.Media != nil && m.Media.FileName != "" {
+					hay += "\n" + m.Media.FileName
+				}
+				for _, l := range m.Links { // a card's address is not in its text
+					hay += "\n" + l.URL
+				}
+				if !containsAll(fold(hay), words) {
+					continue
+				}
 			}
 			hits = append(hits, m)
 			found++
@@ -107,7 +118,7 @@ func (s *store) searchMessages(sp searchParams) []Message {
 	}
 	out := make([]Message, 0, len(hits))
 	for _, m := range hits {
-		out = append(out, snapshot(m))
+		out = append(out, s.view(m))
 	}
 	return out
 }

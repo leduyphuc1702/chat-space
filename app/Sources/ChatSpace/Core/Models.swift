@@ -194,6 +194,12 @@ extension String {
     }
 }
 
+struct TextLink: Codable, Sendable, Equatable {
+    var offset: Int
+    var length: Int
+    var url: String
+}
+
 struct ReplyRef: Codable, Sendable, Equatable {
     var id: String
     var text: String?
@@ -275,6 +281,10 @@ struct Message: Codable, Sendable, Identifiable, Equatable {
     var replyKeyboard: ReplyKeyboard?
     var hideKeyboard: Bool?
     var forceReply: ForceReply?
+    /// Album: messages sent together share it and are drawn as one bubble.
+    var groupId: String?
+    /// Text links whose URL is not in `text` (UTF-16 offsets).
+    var links: [TextLink]?
 
     var date: Date { Date(timeIntervalSince1970: timestamp / 1000) }
     var isDeleted: Bool { deleted ?? false }

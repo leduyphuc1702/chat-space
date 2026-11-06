@@ -1,6 +1,7 @@
 // Pure mapping helpers: GramJS TL objects -> ChatSpace protocol objects.
 // No I/O and no state here; everything environment-specific comes in through MapEnv.
 import { Api, utils } from "telegram";
+import { sanitizeMentions } from "./mentions.ts";
 import type { Button, Chat, ChatKind, Folder, Media, Message, MessageKind, Reaction, ReplyKeyboard } from "./types.ts";
 
 export type Entity = Api.TypeUser | Api.TypeChat;
@@ -279,13 +280,8 @@ function mapMedia(raw: Api.Message): Mapped {
   }
 
   if (media instanceof Api.MessageMediaPoll) {
-    const q = media.poll.question as unknown;
-    const question = typeof q === "string" ? q : ((q as { text?: string })?.text ?? "");
-    const answers = media.poll.answers.map((a) => {
-      const t = (a as { text?: unknown }).text;
-      return `• ${typeof t === "string" ? t : ((t as { text?: string })?.text ?? "")}`;
-    });
-    return { kind: "unsupported", text: [`Poll: ${question}`, ...answers].join("\n") };
+    // Voting is not possible from here, so the poll is shown as the readable text it is (not as "unsupported").
+    return { kind: "text", text: pollText(media) };
   }
   if (media instanceof Api.MessageMediaDice) {
     return { kind: "text", text: `${media.emoticon} ${media.value}` };
@@ -300,10 +296,58 @@ function mapMedia(raw: Api.Message): Mapped {
           ? "Story"
           : media instanceof Api.MessageMediaGiveaway
             ? "Giveaway"
-            : media instanceof Api.MessageMediaPaidMedia
-              ? "Paid media"
-              : "Unsupported message";
+            : media instanceof Api.MessageMediaGiveawayResults
+              ? "Giveaway results"
+              : media instanceof Api.MessageMediaPaidMedia
+                ? "Paid media"
+                : "Unsupported message";
   return { kind: "unsupported", text: [label, caption].filter(Boolean).join("\n") };
+}
+
+/** Telegram sends some strings as plain text and newer layers as TextWithEntities. */
+const plainText = (x: unknown): string => (typeof x === "string" ? x : ((x as { text?: string } | null)?.text ?? ""));
+
+/** "📊 Poll: question" with one line per option: ○ open, ◉ chosen by us, ✓ the quiz answer, and the vote count when known. */
+export function pollText(media: Api.MessageMediaPoll): string {
+  const poll = media.poll;
+  const results = media.results?.results ?? [];
+  const lines = [`\u{1F4CA} ${poll.quiz ? "Quiz" : "Poll"}: ${plainText(poll.question)}`.trim()];
+  for (const a of poll.answers) {
+    const r = results.find((x) => Buffer.compare(Buffer.from(x.option), Buffer.from(a.option)) === 0);
+    const mark = r?.correct ? "\u2713" : r?.chosen ? "\u25C9" : "\u25CB";
+    const votes = r && r.voters > 0 ? ` \u2014 ${r.voters}` : "";
+    lines.push(`${mark} ${plainText(a.text)}${votes}`);
+  }
+  return lines.join("\n");
+}
+
+// ---------------------------------------------------------------- text links
+
+const HAS_SCHEME = /^[a-z][a-z0-9+.-]*:\/\//i;
+const MAX_LINKS = 100;
+
+/**
+ * Links of a message whose target is not simply the text: hidden URLs (MessageEntityTextUrl, "[words](url)"), URLs
+ * written without a scheme ("t.me/x", "example.com/a": the url gets https://) and e-mail addresses (mailto:).
+ * Offsets are UTF-16 into `text`, like Telegram's own, so they are only valid while `text` is the message text itself
+ * (not a rendered placeholder such as a location or poll). Plain `https://…` URLs are left to the app.
+ */
+export function mapLinks(raw: Api.Message, text: string | undefined): NonNullable<Message["links"]> | undefined {
+  if (!text || !raw.entities?.length || text !== raw.message) return undefined;
+  const out: NonNullable<Message["links"]> = [];
+  for (const e of raw.entities) {
+    const { offset, length } = e;
+    if (!(offset >= 0 && length > 0 && offset + length <= text.length)) continue;
+    const shown = text.slice(offset, offset + length);
+    let url: string | undefined;
+    if (e instanceof Api.MessageEntityTextUrl) url = e.url?.trim();
+    else if (e instanceof Api.MessageEntityUrl) url = HAS_SCHEME.test(shown) ? undefined : `https://${shown}`;
+    else if (e instanceof Api.MessageEntityEmail) url = `mailto:${shown}`;
+    if (url) out.push({ offset, length, url });
+    if (out.length >= MAX_LINKS) break;
+  }
+  out.sort((a, b) => a.offset - b.offset);
+  return out.length ? out : undefined;
 }
 
 const VS16 = "\uFE0F";
@@ -431,22 +475,43 @@ function serviceText(a: Api.TypeMessageAction, actor: string, env: MapEnv): stri
   if (a instanceof Api.MessageActionSetChatTheme) return `${actor} changed the chat theme`;
   if (a instanceof Api.MessageActionSetChatWallPaper) return `${actor} changed the chat wallpaper`;
   if (a instanceof Api.MessageActionTopicCreate) return `${actor} created the topic "${a.title}"`;
-  if (a instanceof Api.MessageActionTopicEdit) return `${actor} edited a topic`;
+  if (a instanceof Api.MessageActionTopicEdit) {
+    if (a.title) return `${actor} renamed the topic to "${a.title}"`;
+    if (a.closed !== undefined) return `${actor} ${a.closed ? "closed" : "reopened"} the topic`;
+    if (a.hidden !== undefined) return `${actor} ${a.hidden ? "hid" : "showed"} the topic`;
+    return `${actor} edited a topic`;
+  }
   if (a instanceof Api.MessageActionSuggestProfilePhoto) return `${actor} suggested a profile photo`;
   if (a instanceof Api.MessageActionGiftPremium) {
     return `${actor} gifted Telegram Premium for ${plural(a.months, "month")}`;
   }
+  if (a instanceof Api.MessageActionGiftCode) {
+    return `${actor} received a Telegram Premium gift code for ${plural(a.months, "month")}`;
+  }
+  if (a instanceof Api.MessageActionGiftStars) return `${actor} gifted ${plural(Number(a.stars), "Star")}`;
+  if (a instanceof Api.MessageActionPrizeStars) return `${actor} won ${plural(Number(a.stars), "Star")} in a giveaway`;
+  if (a instanceof Api.MessageActionStarGift || a instanceof Api.MessageActionStarGiftUnique) return `${actor} sent a gift`;
+  if (a instanceof Api.MessageActionBoostApply) return `${actor} boosted the group ${plural(a.boosts, "time")}`;
+  if (a instanceof Api.MessageActionGiveawayLaunch) return "A giveaway started";
+  if (a instanceof Api.MessageActionGiveawayResults) {
+    return `Giveaway ended: ${plural(a.winnersCount, "winner")}`;
+  }
+  if (a instanceof Api.MessageActionPaymentSentMe) return "Payment received";
+  if (a instanceof Api.MessageActionPaymentRefunded) return "Payment refunded";
+  if (a instanceof Api.MessageActionWebViewDataSent) return `${actor} sent data from a web app: ${a.text}`;
+  if (a instanceof Api.MessageActionSecureValuesSent) return `${actor} shared Telegram Passport data`;
+  if (a instanceof Api.MessageActionRequestedPeer) return `${actor} shared a chat with the bot`;
   return `${actor}: ${humanizeClass(a.className)}`;
 }
 
 // ---------------------------------------------------------------- replies
 
-/** Id of the same-chat message this one replies to (forum-topic roots and cross-chat replies excluded). */
 /** The service line "X pinned a message". */
 export function isPinNotice(raw: Api.TypeMessage): boolean {
   return raw instanceof Api.MessageService && raw.action instanceof Api.MessageActionPinMessage;
 }
 
+/** Id of the same-chat message this one replies to (forum-topic roots and cross-chat replies excluded). */
 export function replyTarget(raw: Api.TypeMessage, chatId?: string): number | undefined {
   if (!(raw instanceof Api.Message || raw instanceof Api.MessageService)) return undefined;
   const rh = raw.replyTo;
@@ -475,9 +540,117 @@ const KIND_LABEL: Record<MessageKind, string> = {
   unsupported: "Unsupported message",
 };
 
+const PREVIEW_MAX = 200;
+
+/**
+ * Text of a replied-to message for the quote above a reply. Cut by UTF-16 units but never between the halves of a
+ * surrogate pair: a lone surrogate serialises as "\ud83d", which Swift's JSON decoder rejects, and that dropped the
+ * whole `message.new` / `messages.list` frame the reply was in.
+ */
 export function previewText(m: Pick<Message, "text" | "kind">): string {
-  const t = (m.text ?? "").trim();
-  return (t || KIND_LABEL[m.kind]).slice(0, 200);
+  const t = (m.text ?? "").trim() || KIND_LABEL[m.kind];
+  if (t.length <= PREVIEW_MAX) return t;
+  const last = t.charCodeAt(PREVIEW_MAX - 1);
+  return t.slice(0, last >= 0xd800 && last <= 0xdbff ? PREVIEW_MAX - 1 : PREVIEW_MAX);
+}
+
+export type ReplyPreview = Pick<Message, "text" | "kind" | "senderName">;
+
+/** Fill what the quote needs from the replied-to message. A quoted excerpt (`quoteText`) already in `text` is kept. */
+export function applyReplyPreview(replyTo: NonNullable<Message["replyTo"]>, target: ReplyPreview): void {
+  if (!replyTo.text) replyTo.text = previewText(target);
+  if (target.senderName) replyTo.senderName = target.senderName;
+  replyTo.kind = target.kind;
+}
+
+export function toReplyPreview(m: Message): ReplyPreview {
+  return { text: previewText(m), kind: m.kind, senderName: m.senderName };
+}
+
+/**
+ * Resolves `replyTo` of mapped messages to the message they answer, for as little network as possible: from the
+ * page itself, from messages already seen (`recent`), from earlier lookups (kept, deleted targets too), and
+ * otherwise with ONE batched `fetch` per call (callers pass a page, or the single live message).
+ */
+export class ReplyResolver {
+  private readonly cache = new Map<string, ReplyPreview | null>(); // null = target is gone (deleted)
+
+  constructor(
+    private readonly deps: {
+      recent(chatId: string, id: number): Message | undefined;
+      /** One request for all `ids` of the chat; returns the ones that exist. */
+      fetch(chatId: string, ids: number[]): Promise<Map<number, Message>>;
+      log?(message: string): void;
+    },
+    private readonly max = 5000,
+  ) {}
+
+  forget(chatId: string, id: string | number) {
+    this.cache.delete(`${chatId}:${id}`);
+  }
+
+  clear() {
+    this.cache.clear();
+  }
+
+  private remember(key: string, v: ReplyPreview | null) {
+    this.cache.delete(key);
+    this.cache.set(key, v);
+    if (this.cache.size > this.max) this.cache.delete(this.cache.keys().next().value as string);
+  }
+
+  /** `raws[i]` is the TL message `mapped[i]` was made from. Only same-chat replies are resolved (not cross-chat quotes). */
+  async fill(chatId: string, raws: Api.TypeMessage[], mapped: Message[]): Promise<void> {
+    const target = (i: number) => (raws.length === mapped.length ? replyTarget(raws[i]!, chatId) : undefined);
+    const want = new Set<number>();
+    for (let i = 0; i < mapped.length; i++) {
+      const t = target(i);
+      if (t !== undefined) want.add(t);
+    }
+    if (want.size === 0) return;
+
+    const known = new Map<number, ReplyPreview>();
+    for (const m of mapped) known.set(Number(m.id), m);
+    const missing: number[] = [];
+    for (const id of want) {
+      if (known.has(id)) continue;
+      const hit = this.deps.recent(chatId, id);
+      if (hit) {
+        known.set(id, hit);
+        continue;
+      }
+      const cached = this.cache.get(`${chatId}:${id}`);
+      if (cached) known.set(id, cached);
+      else if (cached === undefined) missing.push(id); // null: known to be deleted, nothing to ask
+    }
+
+    // 100 ids is the most Telegram answers in one getMessages call; a page's replies rarely get near it.
+    for (let i = 0; i < missing.length; i += 100) {
+      const ids = missing.slice(i, i + 100);
+      try {
+        const found = await this.deps.fetch(chatId, ids);
+        for (const id of ids) {
+          const m = found.get(id);
+          if (m) {
+            const p = toReplyPreview(m);
+            known.set(id, p);
+            this.remember(`${chatId}:${id}`, p);
+          } else {
+            this.remember(`${chatId}:${id}`, null);
+          }
+        }
+      } catch (e) {
+        this.deps.log?.(`could not resolve replied-to messages in ${chatId}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+
+    for (let i = 0; i < mapped.length; i++) {
+      const m = mapped[i]!;
+      const t = target(i);
+      const preview = t === undefined ? undefined : known.get(t);
+      if (m.replyTo && preview) applyReplyPreview(m.replyTo, preview);
+    }
+  }
 }
 
 // ---------------------------------------------------------------- bot keyboards
@@ -608,6 +781,13 @@ export function mapMessage(raw: Api.TypeMessage, env: MapEnv, opts: MapOptions =
   msg.kind = mapped.kind;
   if (mapped.text) msg.text = mapped.text;
   if (mapped.media) msg.media = mapped.media;
+  // `text` is always the words as written ("@Name" for a mention, never an id); entities only add information.
+  const links = mapLinks(raw, mapped.text);
+  if (links) msg.links = links;
+  // Album: photos/videos sent together are separate messages that share a groupedId.
+  if (raw.groupedId !== undefined && raw.groupedId !== null && String(raw.groupedId) !== "0") {
+    msg.groupId = String(raw.groupedId);
+  }
 
   const rt = replyTarget(raw, chatId);
   const rh = raw.replyTo;
@@ -784,6 +964,137 @@ export function mapFolders(r: unknown, selfId?: string): Folder[] {
     if (m && !seen.has(m.id)) {
       seen.add(m.id);
       out.push(m);
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------- albums
+
+/**
+ * Items of an album are separate Telegram messages with the same `date` (whole seconds) and consecutive ids, and the
+ * app orders messages by timestamp alone. Within one album, `AlbumClock` spreads equal timestamps by 1 ms in id order
+ * so the items keep their sequence whatever order they are mapped in (history pages ascending, search results
+ * newest first, live items one by one) and whichever of them is seen first. A message seen again (edit, reaction,
+ * re-list) gets the timestamp it was given the first time, so the app never sees an item move.
+ */
+export class AlbumClock {
+  private readonly albums = new Map<string, { id: number; ts: number }[]>();
+
+  constructor(private readonly maxAlbums = 2000) {}
+
+  stamp<T extends Pick<Message, "id" | "chatId" | "groupId" | "timestamp">>(m: T): T {
+    if (!m.groupId) return m;
+    const key = `${m.chatId}:${m.groupId}`;
+    const id = Number(m.id);
+    let items = this.albums.get(key);
+    if (items) {
+      this.albums.delete(key); // refresh recency
+    } else {
+      items = [];
+    }
+    this.albums.set(key, items);
+    if (this.albums.size > this.maxAlbums) this.albums.delete(this.albums.keys().next().value as string);
+
+    const seen = items.find((e) => e.id === id);
+    if (seen) {
+      m.timestamp = seen.ts;
+      return m;
+    }
+    let prev: { id: number; ts: number } | undefined;
+    let next: { id: number; ts: number } | undefined;
+    for (const e of items) {
+      if (e.id < id && (!prev || e.id > prev.id)) prev = e;
+      if (e.id > id && (!next || e.id < next.id)) next = e;
+    }
+    let ts = m.timestamp;
+    if (next && ts >= next.ts) ts = next.ts - 1;
+    if (prev && ts <= prev.ts) ts = prev.ts + 1;
+    m.timestamp = ts;
+    if (items.length < 30) items.push({ id, ts });
+    return m;
+  }
+}
+
+// ---------------------------------------------------------------- mentions (sending)
+
+/**
+ * Mention spans of messages.send / messages.edit -> `InputMessageEntityMentionName` entities. The visible text stays
+ * "@Name" (the app writes it); the entity only tells Telegram who it is, so other clients show the name as a link and
+ * the person is notified. `inputUser` resolves a user id to an InputUser WITH its access hash; a user that cannot be
+ * resolved is skipped (the text is still sent, just without that highlight). Offsets/lengths are UTF-16 code units,
+ * like Telegram's, so spans are passed on unchanged once `sanitizeMentions` has checked them against `text`.
+ */
+export async function buildMentionEntities(
+  text: string,
+  raw: unknown,
+  inputUser: (userId: string) => Promise<Api.TypeInputUser | undefined>,
+): Promise<Api.TypeMessageEntity[] | undefined> {
+  const entities: Api.TypeMessageEntity[] = [];
+  for (const m of sanitizeMentions(text, raw)) {
+    if (!/^\d+$/.test(m.userId)) continue;
+    const userId = await inputUser(m.userId);
+    if (!userId || userId instanceof Api.InputUserEmpty) continue;
+    entities.push(new Api.InputMessageEntityMentionName({ offset: m.offset, length: m.length, userId }));
+  }
+  return entities.length ? entities : undefined;
+}
+
+/** Telegram refuses a send/edit whose mention entity it cannot accept; the text is then sent without entities. */
+export const MENTION_REJECTED = new Set([
+  "USER_ID_INVALID",
+  "ENTITY_MENTION_USER_INVALID",
+  "ENTITY_BOUNDS_INVALID",
+  "INPUT_USER_DEACTIVATED",
+]);
+
+// ---------------------------------------------------------------- search
+
+/**
+ * Server-side filters for the requested kinds (messages.search / searchGlobal take one filter per request, so the
+ * result can be several). image+video together is Telegram's PhotoVideo. A kind with no server filter (text, sticker,
+ * or none given) means "everything", narrowed afterwards by the caller. Duplicates never occur.
+ */
+export function searchFilters(kinds?: readonly string[]): Api.TypeMessagesFilter[] {
+  const k = new Set(kinds ?? []);
+  const out: Api.TypeMessagesFilter[] = [];
+  if (k.size === 0) return [new Api.InputMessagesFilterEmpty()];
+  if (k.has("image") && k.has("video")) {
+    out.push(new Api.InputMessagesFilterPhotoVideo());
+    k.delete("image");
+    k.delete("video");
+  }
+  for (const kind of k) {
+    switch (kind) {
+      case "image":
+        out.push(new Api.InputMessagesFilterPhotos());
+        break;
+      case "video":
+        out.push(new Api.InputMessagesFilterVideo());
+        break;
+      case "file":
+        out.push(new Api.InputMessagesFilterDocument());
+        break;
+      case "link":
+        out.push(new Api.InputMessagesFilterUrl());
+        break;
+      case "voice":
+        out.push(new Api.InputMessagesFilterVoice());
+        break;
+      case "audio":
+        out.push(new Api.InputMessagesFilterMusic());
+        break;
+      case "gif":
+        out.push(new Api.InputMessagesFilterGif());
+        break;
+      case "location":
+        out.push(new Api.InputMessagesFilterGeo());
+        break;
+      case "contact":
+        out.push(new Api.InputMessagesFilterContacts());
+        break;
+      default:
+        return [new Api.InputMessagesFilterEmpty()]; // text, sticker, …: no server filter
     }
   }
   return out;

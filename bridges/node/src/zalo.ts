@@ -43,9 +43,13 @@ import {
   type StorageConfig,
 } from "./types.ts";
 import {
+  ALBUM_MAX_SPREAD_MS,
+  albumOf,
+  albumTimestamps,
   chatIdOf,
   computeReactions,
   emojiToIcon,
+  fixMentionText,
   kindFromFile,
   mapContent,
   mimeFromName,
@@ -54,6 +58,7 @@ import {
   pinToMessage,
   quoteToReply,
   readImageMeta,
+  recallEvent,
   str,
   toMs,
   type PinTopic,
@@ -83,6 +88,8 @@ const DIR_STALE_MS = 10 * 60_000;
 const NOTIFY_POLL_MS = 5 * 60_000;
 /** Most messages one on-demand getGroupChatHistory asks for (it has no paging cursor; server cap not verified). */
 const OLDER_HISTORY_MAX = 500;
+/** msgTypes whose stored kind / text / media are derived again from the raw content on start (see remapStored). */
+const REMAP_TYPES = new Set(["chat.recommended", "chat.link", "chat.list.action", "chat.webcontent", "chat.webcontent.v2", "chat.delete"]);
 /** getMute `muteMode` of an entry that was switched off again (zca-js MuteAction.UNMUTE). */
 const MUTE_MODE_OFF = 3;
 /** A mute set through chats.mute is not overwritten by a getMute poll that started within this long before it (or after). */
@@ -240,6 +247,7 @@ export class ZaloAdapter extends Adapter {
     "search",
     "mute",
     "pins",
+    "direct_chat",
     // the transfer is decrypted with Zalo's own library, read from the installed Zalo PC
     ...(existsSync(ZALO_ASAR) ? ["phone_sync"] : []),
   ];
@@ -340,6 +348,7 @@ export class ZaloAdapter extends Adapter {
 
   async start(_config: Record<string, unknown>): Promise<void> {
     this.store.load();
+    this.remapStored();
     this.friendsKnown = Object.values(this.store.contacts).some((c) => c.fr);
     this.selfId = this.store.selfId ?? "";
     const creds = this.readCredentials();
@@ -1730,6 +1739,47 @@ export class ZaloAdapter extends Adapter {
   }
 
   /**
+   * chats.direct (capability "direct_chat"): the one-to-one chat with a group member, `userId` being a group
+   * `Message.senderId` (a Zalo uid). The id is the one messages.send / messages.list take for a user thread
+   * ("u:<uid>"; the Cloud chat for our own uid). Nothing is sent to the person and nothing is stored for a chat that
+   * has no message yet: the answer is the stored chat when there is one, else the same chat built from what is known.
+   * Zalo lets us write to a non-friend, so there is no check here; a refusal comes back from messages.send.
+   *
+   * The title is a name we already hold (contacts, the stored chat, the name a group message came with); only when
+   * there is none does one getUserInfo run, shared and cached for a few minutes with chats.members.
+   */
+  async directChat(userId: string): Promise<Chat> {
+    this.requireLogin();
+    const uid = str(userId).trim();
+    if (!/^\d+$/.test(uid)) {
+      throw new BridgeError("invalid_params", `bad userId "${uid}" (expected a Zalo uid: the senderId of a group message)`);
+    }
+    const chatId = chatIdOf(ThreadType.User, uid);
+    const named = uid === this.selfId || !!this.nameOf(uid) || !!nonEmpty(this.store.chats[chatId]?.title);
+    if (!named) {
+      const seen = this.knownSender(uid);
+      if (seen) this.remember(uid, seen.name, seen.avatar);
+      else if (this.api) await this.chatMembers(chatId);
+    }
+    return this.buildChat(chatId);
+  }
+
+  /** The name (and picture) a stored group message of `uid` came with, newest first; undefined when none was kept. */
+  private knownSender(uid: string): { name: string; avatar?: string } | undefined {
+    for (const chatId of this.store.chatIds()) {
+      if (!chatId.startsWith("g:")) continue;
+      const list = this.store.list(chatId);
+      for (let i = list.length - 1; i >= 0; i--) {
+        const m = list[i]!.m;
+        if (m.senderId !== uid || m.fromMe) continue;
+        const name = nonEmpty(m.senderName);
+        if (name) return { name, avatar: nonEmpty(m.senderAvatar) };
+      }
+    }
+    return undefined;
+  }
+
+  /**
    * Members for the @mention picker. Group: getGroupInfo gives the ids (memVerList = "uid_version", plus memberIds and
    * the partial currentMems); names come from the contact store, then currentMems, then getGroupMembersInfo for the
    * rest (and are remembered, so the next group that shares them needs no request). 1:1: the other participant.
@@ -1860,8 +1910,10 @@ export class ZaloAdapter extends Adapter {
     const uidFrom = str(d.uidFrom);
     const fromMe = zm.isSelf || (!!this.selfId && uidFrom === this.selfId);
     const msgType = str(d.msgType);
-    const mapped = mapContent(msgType, d.content);
+    const mapped = mapContent(msgType, d.content, { fromMe });
     let { text, media } = mapped;
+    // Group messages carry the mention spans beside the text; they rewrite a span that holds an id instead of a name.
+    if (text && Array.isArray(d.mentions)) text = fixMentionText(text, d.mentions, (uid) => this.nameOf(uid));
     const gid = str(d.msgId);
     const id = gid && gid !== "0" ? gid : str(d.cliMsgId);
     if (mapped.sticker) {
@@ -1890,6 +1942,7 @@ export class ZaloAdapter extends Adapter {
       media,
       replyTo: quoteToReply(d.quote),
       status: fromMe ? "sent" : undefined,
+      groupId: albumOf(msgType, d.content)?.groupId,
     };
     const z: ZMeta = {
       t: zm.type === ThreadType.Group ? 1 : 0,
@@ -1917,6 +1970,12 @@ export class ZaloAdapter extends Adapter {
   private ingestEntry(entry: Entry, opts: IngestOpts) {
     const m = entry.m;
     const chatId = m.chatId;
+    // A recall event in a history listing only names the message to recall; it is not a message to show.
+    const recall = recallEvent(entry.z.msgType, entry.z.content);
+    if (recall) {
+      this.recallStored(chatId, recall, !opts.silent);
+      return;
+    }
     const existing = this.store.find(chatId, m.id);
     if (existing) {
       this.mergeExisting(existing, entry, opts);
@@ -1926,6 +1985,8 @@ export class ZaloAdapter extends Adapter {
     const prevTs = sc.timestamp;
     const lastOwnTs = this.lastOwnTs(chatId); // before the insert
     this.store.insert(chatId, entry);
+    // Album members arrive in upload order; the grid must follow the order the sender picked (see albumTimestamps).
+    const reordered = m.groupId ? this.settleAlbum(chatId, entry) : [];
     const newest = m.timestamp >= prevTs;
     if (newest) sc.timestamp = m.timestamp;
     if (!m.fromMe && m.kind !== "system" && m.senderName && chatId.startsWith("u:") && !sc.title) {
@@ -1946,6 +2007,8 @@ export class ZaloAdapter extends Adapter {
     if (!opts.replay) this.store.meta.activeTs = Date.now();
     this.store.touch();
     if (opts.silent) return;
+    // Siblings that got a new place in their album (the app re-sorts its list the next time it fetches or gets a message).
+    for (const e of reordered) if (e !== entry && !e.m.deleted) this.ctx.emit("message.update", { message: e.m });
     // A replayed message older than what we already show is backfill: it is served by messages.list.
     if (!opts.replay || newest) {
       // Real time = straight from the listener's "message" event (not a replay / old_messages / history call)
@@ -2044,6 +2107,115 @@ export class ZaloAdapter extends Adapter {
     e.m.reactions = undefined;
     e.z.reacts = undefined;
     this.store.touch();
+  }
+
+  /** Mark the message a recall event names as deleted. False when we do not have it. */
+  private recallStored(chatId: string, ev: { msgId: string; cliMsgId: string }, notify: boolean): boolean {
+    const e = (ev.msgId ? this.store.find(chatId, ev.msgId) : undefined) ?? this.store.findByCli(chatId, ev.cliMsgId);
+    if (!e) return false;
+    if (!e.m.deleted) {
+      this.markDeleted(e);
+      if (notify) {
+        this.ctx.emit("message.update", { message: e.m });
+        this.scheduleUpsert(chatId);
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Give the members of one album (same sender and group id) their timestamps back in the order the sender picked.
+   * Returns the entries that moved; the caller re-sorts the chat (store.resort) once it has handled every album.
+   */
+  private retimeAlbum(members: Entry[]): Entry[] {
+    const changes = albumTimestamps(
+      members.map((e) => ({
+        id: e.m.id,
+        ts: e.m.timestamp,
+        cli: Number(e.z.cliMsgId) || 0,
+        index: albumOf(e.z.msgType, e.z.content)?.index ?? 0,
+      })),
+    );
+    if (!changes.size) return [];
+    const moved = members.filter((e) => changes.has(e.m.id));
+    for (const e of moved) e.m.timestamp = changes.get(e.m.id)!;
+    return moved;
+  }
+
+  /** A new album member was stored: re-time it together with the members already there (they are close in time). */
+  private settleAlbum(chatId: string, entry: Entry): Entry[] {
+    const list = this.store.list(chatId);
+    const from = entry.m.timestamp - ALBUM_MAX_SPREAD_MS;
+    const members: Entry[] = [];
+    for (let i = list.length - 1; i >= 0; i--) {
+      const e = list[i]!;
+      if (e.m.timestamp < from) break;
+      if (e.m.groupId === entry.m.groupId && e.z.uidFrom === entry.z.uidFrom) members.push(e);
+    }
+    const moved = this.retimeAlbum(members);
+    if (moved.length) this.store.resort(chatId);
+    return moved;
+  }
+
+  /**
+   * Bring what an earlier version stored up to the current mapping, from the raw content kept in every entry: call
+   * logs, link / contact cards, zinstant cards and notices (they read "sendBubbleMessage Cuộc gọi" or "Tin nhắn chưa
+   * được hỗ trợ" before), album ids and album order, recall events listed as messages. Runs on every start; it only
+   * writes what differs, so a second run changes nothing.
+   */
+  private remapStored(): number {
+    let changed = 0;
+    for (const chatId of this.store.chatIds()) {
+      const albums = new Map<string, Entry[]>();
+      for (const e of [...this.store.list(chatId)]) {
+        const { m, z } = e;
+        const recall = recallEvent(z.msgType, z.content);
+        if (recall) {
+          this.recallStored(chatId, recall, false);
+          this.store.remove(chatId, m.id);
+          changed++;
+          continue;
+        }
+        if (m.deleted) continue;
+        if (REMAP_TYPES.has(z.msgType) && z.content !== undefined && z.content !== null) {
+          const mapped = mapContent(z.msgType, z.content, { fromMe: m.fromMe });
+          if (
+            mapped.kind !== m.kind ||
+            mapped.text !== m.text ||
+            mapped.media?.url !== m.media?.url ||
+            mapped.media?.thumbnail !== m.media?.thumbnail
+          ) {
+            m.kind = mapped.kind;
+            m.text = mapped.text;
+            m.media = mapped.media ? { ...mapped.media, path: m.media?.path } : undefined;
+            changed++;
+          }
+        }
+        const album = albumOf(z.msgType, z.content);
+        if (album) {
+          if (m.groupId !== album.groupId) {
+            m.groupId = album.groupId;
+            changed++;
+          }
+          const key = `${album.groupId}|${z.uidFrom}`;
+          albums.set(key, [...(albums.get(key) ?? []), e]);
+        }
+      }
+      let moved = false;
+      for (const members of albums.values()) {
+        const n = this.retimeAlbum(members).length;
+        if (n) {
+          moved = true;
+          changed += n;
+        }
+      }
+      if (moved) this.store.resort(chatId);
+    }
+    if (changed) {
+      this.log(`remapped ${changed} stored message(s) to the current mapping`);
+      this.store.touch();
+    }
+    return changed;
   }
 
   private applyUndo(u: ZUndo) {
@@ -2386,7 +2558,7 @@ export class ZaloAdapter extends Adapter {
       ids.map((id) => [id, this.store.list(id)] as [string, Entry[]]),
       p,
       (e) => this.outbound(e.m),
-      (e) => [e.m.text, e.m.deleted, e.m.media?.fileName],
+      (e) => [e.m.text, e.m.deleted, e.m.media?.fileName, e.m.kind, e.m.timestamp],
     );
   }
 

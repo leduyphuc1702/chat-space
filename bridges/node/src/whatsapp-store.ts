@@ -148,6 +148,8 @@ export class WAStore {
   chats = new Map<string, StoredChat>();
   contacts = new Map<string, StoredContact>();
   lid2pn = new Map<string, string>();
+  /** phone jid -> its LIDs, built on demand for aliasesOf() and dropped whenever lid2pn changes */
+  private pn2lids?: Map<string, string[]>;
   groups = new Map<string, GroupInfo>();
   /** pin records per chat (see StoredPin); persisted in the index */
   pins = new Map<string, StoredPin[]>();
@@ -195,6 +197,7 @@ export class WAStore {
         for (const c of j.chats ?? []) this.chats.set(c.id, c);
         for (const c of j.contacts ?? []) this.contacts.set(c.id, c);
         for (const [l, p] of j.lid2pn ?? []) this.lid2pn.set(l, p);
+        this.pn2lids = undefined;
         for (const [id, g] of j.groups ?? []) this.groups.set(id, g);
         for (const [id, list] of j.pins ?? []) this.pins.set(id, list);
         if (file === this.indexPath) this.dirtyIndex = true; // legacy plain file: rewrite it compressed
@@ -414,6 +417,7 @@ export class WAStore {
     this.chats.clear();
     this.contacts.clear();
     this.lid2pn.clear();
+    this.pn2lids = undefined;
     this.groups.clear();
     this.pins.clear();
     this.msgs.clear();
@@ -438,6 +442,26 @@ export class WAStore {
     return (isLidUser(n) && this.lid2pn.get(n)) || n;
   }
 
+  /**
+   * Every spelling we know of one person: the jid itself (device stripped), its canonical form, the phone jid of a LID
+   * and the LIDs of a phone jid. @mention tokens in a text may use any of them.
+   */
+  aliasesOf(jid?: string | null): string[] {
+    const n = normJid(jid);
+    if (!n) return [];
+    const out = new Set<string>([n]);
+    const pn = isLidUser(n) ? this.lid2pn.get(n) : isPnUser(n) ? n : undefined;
+    if (pn) {
+      out.add(pn);
+      if (!this.pn2lids) {
+        this.pn2lids = new Map();
+        for (const [l, p] of this.lid2pn) this.pn2lids.set(p, [...(this.pn2lids.get(p) ?? []), l]);
+      }
+      for (const l of this.pn2lids.get(pn) ?? []) out.add(l);
+    }
+    return [...out];
+  }
+
   /** Remember that `lid` and `pn` are the same person; folds any LID-keyed chat into the PN one. */
   link(lid?: string | null, pn?: string | null): boolean {
     const l = normJid(lid);
@@ -445,6 +469,7 @@ export class WAStore {
     if (!l || !p || !isLidUser(l) || !isPnUser(p)) return false;
     if (this.lid2pn.get(l) === p) return false;
     this.lid2pn.set(l, p);
+    this.pn2lids = undefined;
     this.dirtyIndex = true;
     this.mergeInto(l, p);
     this.schedule();
@@ -642,6 +667,7 @@ export class WAStore {
       // Keep our locally-merged reactions/receipts/status; take everything else from the newer copy.
       const merged = { ...old, ...raw };
       if (!raw.message && old.message) merged.message = old.message;
+      else if (raw.message && old.message) keepContextInfo(old.message, raw.message); // e.g. the album association
       if (old.reactions?.length && !raw.reactions?.length) merged.reactions = old.reactions;
       if (old.userReceipt?.length && !raw.userReceipt?.length) merged.userReceipt = old.userReceipt;
       const os = num(old.status);
@@ -764,6 +790,19 @@ const LINK_PREVIEW = ["matchedText", "canonicalUrl", "title", "description", "jp
  * media keys survive, and a media message gets the text as its caption.
  */
 export function editedContent(old: any, edited: any): any {
+  return keepContextInfo(old, mergeEdit(old, edited));
+}
+
+/**
+ * messageContextInfo carries things that outlive any rewrite of the content: the album association of a photo, the
+ * message secret. A replacement content (edit, refreshed media) that comes without one keeps the old one.
+ */
+export function keepContextInfo(old: any, next: any): any {
+  if (old?.messageContextInfo && next && typeof next === "object" && !next.messageContextInfo) next.messageContextInfo = old.messageContextInfo;
+  return next;
+}
+
+function mergeEdit(old: any, edited: any): any {
   const next = plainContent(edited);
   if (!old || !next) return next;
   const out = structuredClone(old);

@@ -284,6 +284,14 @@ export class ZaloStore {
     return true;
   }
 
+  /** Put a chat's list back in timestamp order after some entries' `m.timestamp` were changed in place (stable). */
+  resort(chatId: string) {
+    const list = this.data.messages[chatId];
+    if (!list) return;
+    list.sort((a, b) => a.m.timestamp - b.m.timestamp);
+    this.touch();
+  }
+
   remove(chatId: string, msgId: string): boolean {
     const idx = this.idx(chatId);
     const e = idx.get(msgId);

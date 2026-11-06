@@ -24,9 +24,12 @@ package main
 // History:      messages from before this device was registered are only in the
 //               account's encrypted backup, readable once the user enters their
 //               secure storage PIN (history.go).
-// What doesn't: rich "Armadillo" content (link-share cards, stories, location sharing,
-//               polls, contacts) is shown as a placeholder text. Editing our own
-//               E2EE messages from ChatSpace isn't exposed by the protocol.
+// Payloads:     e2ee_content.go maps every ConsumerApplication / Armadillo payload: text
+//               with mentions and link previews, media, albums, polls, contacts, locations,
+//               link cards, story replies, call logs. Reactions, edits, unsends and
+//               protocol-only payloads never create a bubble; what has no sensible text
+//               is kind "unsupported" with a short sentence.
+// What doesn't: Editing our own E2EE messages from ChatSpace isn't exposed by the protocol.
 
 import (
 	"bytes"
@@ -522,121 +525,18 @@ func transportInfo(tr *waMediaTransport.WAMediaTransport, typ string) (*Media, *
 	return m, ref
 }
 
-type waContent struct {
-	kind  string
-	text  string
-	media *Media
-	ref   *waMediaRef
-}
-
-func (e *e2eeState) decodeContent(content *waConsumerApplication.ConsumerApplication_Content) (c waContent, ok bool) {
-	c.kind = "text"
-	switch v := content.GetContent().(type) {
-	case *waConsumerApplication.ConsumerApplication_Content_MessageText:
-		c.text = v.MessageText.GetText()
-	case *waConsumerApplication.ConsumerApplication_Content_ExtendedTextMessage:
-		c.text = v.ExtendedTextMessage.GetText().GetText()
-	case *waConsumerApplication.ConsumerApplication_Content_ImageMessage:
-		return e.decodeImage(v.ImageMessage)
-	case *waConsumerApplication.ConsumerApplication_Content_StickerMessage:
-		dec, err := v.StickerMessage.Decode()
-		if err != nil {
-			c.text = "Sticker (could not be decoded)"
-			return c, true
-		}
-		c.kind = "sticker"
-		if id := dec.GetAncillary().GetReceiverFetchID(); id != "" {
-			ctx, cancel := context.WithTimeout(e.ctx, 15*time.Second)
-			defer cancel()
-			if media, err := e.plain.FetchReceiverFetchMedia(ctx, id); err == nil {
-				c.media = &Media{Mime: media.MimeType, URL: media.URL, Width: media.Width, Height: media.Height}
-				return c, true
-			}
-		}
-		c.media, c.ref = transportInfo(dec.GetIntegral().GetTransport(), "image")
-		c.media.Width, c.media.Height = int(dec.GetAncillary().GetWidth()), int(dec.GetAncillary().GetHeight())
-	case *waConsumerApplication.ConsumerApplication_Content_VideoMessage:
-		return e.decodeVideo(v.VideoMessage)
-	case *waConsumerApplication.ConsumerApplication_Content_AudioMessage:
-		dec, err := v.AudioMessage.Decode()
-		if err != nil {
-			c.text = "Voice message (could not be decoded)"
-			return c, true
-		}
-		c.kind = "voice"
-		c.media, c.ref = transportInfo(dec.GetIntegral().GetTransport(), "audio")
-		c.media.Duration = float64(dec.GetAncillary().GetSeconds())
-	case *waConsumerApplication.ConsumerApplication_Content_DocumentMessage:
-		dec, err := v.DocumentMessage.Decode()
-		if err != nil {
-			c.text = "File (could not be decoded)"
-			return c, true
-		}
-		c.kind = "file"
-		c.media, c.ref = transportInfo(dec.GetIntegral().GetTransport(), "document")
-		c.media.FileName = v.DocumentMessage.GetFileName()
-	case *waConsumerApplication.ConsumerApplication_Content_ViewOnceMessage:
-		switch vv := v.ViewOnceMessage.GetViewOnceContent().(type) {
-		case *waConsumerApplication.ConsumerApplication_ViewOnceMessage_ImageMessage:
-			return e.decodeImage(vv.ImageMessage)
-		case *waConsumerApplication.ConsumerApplication_ViewOnceMessage_VideoMessage:
-			return e.decodeVideo(vv.VideoMessage)
-		}
-		c.text = "View-once message (open it in the Messenger app)"
-	case *waConsumerApplication.ConsumerApplication_Content_LocationMessage:
-		c.kind = "location"
-		c.text = strings.TrimSpace(v.LocationMessage.GetLocation().GetName() + "\n" + v.LocationMessage.GetAddress())
-		if c.text == "" {
-			c.text = "Location"
-		}
-	default:
-		c.text = "Unsupported message (open it in the Messenger app)"
-	}
-	return c, true
-}
-
-func (e *e2eeState) decodeImage(msg *waConsumerApplication.ConsumerApplication_ImageMessage) (c waContent, ok bool) {
-	c.kind = "image"
-	dec, err := msg.Decode()
-	if err != nil {
-		c.text = "Photo (could not be decoded)"
-		return c, true
-	}
-	c.media, c.ref = transportInfo(dec.GetIntegral().GetTransport(), "image")
-	c.media.Width, c.media.Height = int(dec.GetAncillary().GetWidth()), int(dec.GetAncillary().GetHeight())
-	c.text = msg.GetCaption().GetText()
-	return c, true
-}
-
-func (e *e2eeState) decodeVideo(msg *waConsumerApplication.ConsumerApplication_VideoMessage) (c waContent, ok bool) {
-	c.kind = "video"
-	dec, err := msg.Decode()
-	if err != nil {
-		c.text = "Video (could not be decoded)"
-		return c, true
-	}
-	c.media, c.ref = transportInfo(dec.GetIntegral().GetTransport(), "video")
-	anc := dec.GetAncillary()
-	c.media.Width, c.media.Height = int(anc.GetWidth()), int(anc.GetHeight())
-	c.media.Duration = float64(anc.GetSeconds())
-	switch {
-	case strings.HasPrefix(c.media.Mime, "image/"):
-		c.kind = "image" // Facebook sometimes wraps images in video containers
-	case anc.GetGifPlayback():
-		c.kind = "gif"
-	}
-	c.text = msg.GetCaption().GetText()
-	return c, true
-}
-
 func (e *e2eeState) onMessage(evt *events.FBMessage) { e.ingest(evt, false) }
 
 // ingest stores one decrypted message. history marks messages restored from the
 // encrypted backup (history.go): they never count as unread and are returned by
 // messages.list instead of being pushed as message.new.
+//
+// classify (e2ee_content.go) decides what the payload is: a reaction, edit or unsend
+// (applied to an existing message, no bubble), a protocol-only payload (nothing), or one
+// or more parts that become messages. Parts of one payload (an album, a photo with its
+// caption) share a groupId, the id of the first.
 func (e *e2eeState) ingest(evt *events.FBMessage, history bool) {
 	b := e.b
-	app, isConsumer := evt.Message.(*waConsumerApplication.ConsumerApplication)
 	if evt.Message == nil {
 		return // e.g. disappearing-message setting changes
 	}
@@ -653,34 +553,29 @@ func (e *e2eeState) ingest(evt *events.FBMessage, history bool) {
 	if fromMe {
 		actor = selfStr
 	}
+	senderName, who := selfName, "You"
+	if !fromMe {
+		senderName = e.displayName(actor, evt.Info.PushName)
+		who = senderName
+	}
 
-	var c waContent
-	if !isConsumer {
-		// Armadillo (rich cards, stories, ...) and Instagram payloads.
-		c = waContent{kind: "text", text: "Unsupported encrypted message (open it in the Messenger app)"}
-	} else {
-		switch p := app.GetPayload().GetPayload().(type) {
-		case *waConsumerApplication.ConsumerApplication_Payload_Content:
-			switch v := p.Content.GetContent().(type) {
-			case *waConsumerApplication.ConsumerApplication_Content_ReactionMessage:
-				e.onReaction(chat, actor, v.ReactionMessage)
-				return
-			case *waConsumerApplication.ConsumerApplication_Content_EditMessage:
-				e.onEdit(chat, v.EditMessage)
-				return
-			}
-			var ok bool
-			if c, ok = e.decodeContent(p.Content); !ok {
-				return
-			}
-		case *waConsumerApplication.ConsumerApplication_Payload_ApplicationData:
-			if rev, ok := p.ApplicationData.GetApplicationContent().(*waConsumerApplication.ConsumerApplication_ApplicationData_Revoke); ok {
-				e.onRevoke(chat, rev.Revoke.GetKey().GetID())
-			}
-			return
-		default:
-			return
-		}
+	act := e.classify(evt, chat, who)
+	switch {
+	case act.reaction != nil:
+		e.onReaction(chat, actor, act.reaction)
+		return
+	case act.edit != nil:
+		e.onEdit(chat, act.edit)
+		return
+	case act.revokeID != "":
+		e.onRevoke(chat, act.revokeID)
+		return
+	case len(act.parts) == 0:
+		return // protocol-only: nothing to show
+	}
+	if act.unsupported != "" {
+		// Only the payload type, never its content: this is how new kinds get noticed.
+		b.log.Info().Str("type", act.unsupported).Msg("e2ee: payload shown as unsupported")
 	}
 
 	// Make sure the chat exists / is flagged E2EE.
@@ -699,71 +594,93 @@ func (e *e2eeState) ingest(evt *events.FBMessage, history bool) {
 		}
 	}
 
-	senderName := selfName
-	if !fromMe {
-		senderName = e.displayName(actor, evt.Info.PushName)
+	groupID := evt.FBApplication.GetMetadata().GetGroupID()
+	if groupID == "" && len(act.parts) > 1 {
+		groupID = evt.Info.ID
 	}
-	sm := &storedMsg{
-		Message: Message{
-			ID: evt.Info.ID, ChatID: chat, SenderID: actor, SenderName: senderName, FromMe: fromMe,
-			Timestamp: ts, Kind: c.kind, Text: c.text, Media: c.media,
-		},
-		Sort:      ts,
-		SenderJID: evt.Info.Sender.ToNonAD().String(),
-		WAMedia:   c.ref,
-	}
-	if fromMe {
-		sm.Status = "sent"
-	}
+	var replyTo string
+	var reply *Reply
 	if qm := evt.FBApplication.GetMetadata().GetQuotedMessage(); qm != nil {
-		sm.WAReplyTo = qm.GetStanzaID()
-		sm.ReplyTo = e.replyView(chat, qm.GetStanzaID())
+		replyTo = qm.GetStanzaID()
+		reply = e.replyView(chat, replyTo)
 	}
 
-	isNew, changed, snap := b.st.putMessage(sm)
-	if !isNew && !changed {
+	type stored struct {
+		isNew, changed bool
+		snap           Message
+	}
+	var out []stored
+	for i, c := range act.parts {
+		id, pts := evt.Info.ID, ts
+		if i > 0 {
+			id, pts = fmt.Sprintf("%s:%d", evt.Info.ID, i), ts+int64(i)
+		}
+		sm := &storedMsg{
+			Message: Message{
+				ID: id, ChatID: chat, SenderID: actor, SenderName: senderName, FromMe: fromMe,
+				Timestamp: pts, Kind: c.kind, Text: c.text, Media: c.media, Links: c.links, GroupID: groupID,
+			},
+			Sort:      pts,
+			SenderJID: evt.Info.Sender.ToNonAD().String(),
+			WAMedia:   c.ref,
+		}
+		if fromMe {
+			sm.Status = "sent"
+		}
+		if i == 0 && replyTo != "" {
+			sm.WAReplyTo, sm.ReplyTo = replyTo, reply
+		}
+		isNew, changed, snap := b.st.putMessage(sm)
+		if isNew || changed {
+			out = append(out, stored{isNew, changed, snap})
+		}
+	}
+	if len(out) == 0 {
 		return
 	}
-	if isNew && history {
+	last := out[len(out)-1].snap
+	anyNew := false
+	for _, o := range out {
+		anyNew = anyNew || o.isNew
+	}
+	if anyNew {
 		b.st.updateThread(chat, func(t *threadRec) {
 			if ts >= t.LastActivity {
 				t.LastActivity = ts
-				if txt := previewText(snap); txt != "" {
+				if txt := previewText(last); txt != "" {
 					t.Snippet = txt
 				}
 			}
-		})
-	} else if isNew {
-		b.st.updateThread(chat, func(t *threadRec) {
-			if ts >= t.LastActivity {
-				t.LastActivity = ts
-				if txt := previewText(snap); txt != "" {
-					t.Snippet = txt
-				}
+			if history {
+				return
 			}
 			if fromMe {
 				// Sending (from any device) marks the chat read.
 				t.LastRead = max(t.LastRead, ts)
 				t.Unread = 0
 			} else if ts > t.LastRead {
-				t.Unread++
+				t.Unread++ // one per payload, however many bubbles it makes
 			}
 		})
 	}
 	if created {
 		b.emitChat(chat) // the app learns about the chat before its first message
 	}
-	switch {
-	case history:
-		// Restored pages reach the app through messages.list; the caller emits the chat.
-	case isNew:
-		// Live = arrived in real time on an established E2EE socket, not part of the
-		// offline replay and not old. The chat.upsert right after carries the new unread.
-		live := e.ready.Load() && !e.offline.Load() && isFresh(ts)
-		b.emit("message.new", map[string]any{"message": snap, "live": live})
+	// Live = arrived in real time on an established E2EE socket, not part of the offline
+	// replay and not old. The chat.upsert right after carries the new unread.
+	live := e.ready.Load() && !e.offline.Load() && isFresh(ts)
+	for _, o := range out {
+		switch {
+		case history:
+			// Restored pages reach the app through messages.list; the caller emits the chat.
+		case o.isNew:
+			b.emit("message.new", map[string]any{"message": o.snap, "live": live})
+		default:
+			b.emit("message.update", map[string]any{"message": o.snap})
+		}
+	}
+	if anyNew && !history {
 		b.emitChat(chat)
-	default:
-		b.emit("message.update", map[string]any{"message": snap})
 	}
 	if isGroup {
 		if t, ok := b.st.thread(chat); ok && t.Name == "" {
@@ -887,12 +804,13 @@ func (e *e2eeState) onEdit(chat string, ed *waConsumerApplication.ConsumerApplic
 	if id == "" {
 		return
 	}
-	text := ed.GetMessage().GetText()
+	text := e.textOf(chat, ed.GetMessage())
 	snap, changed, ok := b.st.mutateMessage(id, func(m *storedMsg) {
 		if m.Deleted || m.Text == text {
 			return
 		}
 		m.Text, m.Edited = text, true
+		m.Links = nil // their offsets belonged to the old text
 	})
 	if ok && changed {
 		b.emit("message.update", map[string]any{"message": snap})
@@ -908,11 +826,26 @@ func (e *e2eeState) onRevoke(chat, id string) {
 	if id == "" {
 		return
 	}
-	snap, changed, ok := b.st.mutateMessage(id, func(m *storedMsg) {
-		m.Deleted, m.Text, m.Media, m.WAMedia, m.Actors, m.Reactions = true, "", nil, nil, nil, nil
-	})
-	if ok && changed {
-		b.emit("message.update", map[string]any{"message": snap})
+	// A payload that made several bubbles (album, photo + caption) is unsent as a whole:
+	// its extra parts are "<id>:<n>".
+	changedAny := false
+	for n := 0; n < 20; n++ {
+		target := id
+		if n > 0 {
+			target = fmt.Sprintf("%s:%d", id, n)
+		}
+		snap, changed, ok := b.st.mutateMessage(target, func(m *storedMsg) {
+			m.Deleted, m.Text, m.Media, m.WAMedia, m.Actors, m.Reactions, m.Links = true, "", nil, nil, nil, nil, nil
+		})
+		if !ok {
+			break
+		}
+		if changed {
+			changedAny = true
+			b.emit("message.update", map[string]any{"message": snap})
+		}
+	}
+	if changedAny {
 		b.emitChat(chat)
 	}
 }

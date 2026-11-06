@@ -111,11 +111,24 @@ func (b *bridge) chatMembers(ctx context.Context, chat string) ([]Member, error)
 	}
 	selfID, selfName := b.selfInfo()
 	self := chatKey(selfID)
+	var pushNames map[string]string // names carried by messages, for people without a contact row
 	view := func(id string) Member {
 		m := Member{ID: id, Name: id}
-		if co, ok := b.st.contact(id); ok {
-			m.Name, m.Avatar = firstNonEmpty(co.Name, id), co.Avatar
+		co, ok := b.st.contact(id)
+		if ok {
+			m.Name = firstNonEmpty(co.Name, id)
 		}
+		if !ok || co.Name == "" {
+			if pushNames == nil {
+				pushNames = b.st.senderNames()
+			}
+			m.Name = firstNonEmpty(pushNames[id], m.Name)
+		}
+		cands := []string{co.Avatar}
+		if !t.IsGroup && id == peerID(t) {
+			cands = append(cands, t.Avatar)
+		}
+		m.Avatar = b.st.avatarFor(id, cands...)
 		if id == self {
 			m.Name = firstNonEmpty(selfName, m.Name)
 		}

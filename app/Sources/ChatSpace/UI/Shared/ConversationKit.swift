@@ -9,30 +9,56 @@ struct MessageRow: Identifiable {
     let showDayHeader: Bool
     /// Messenger/Zalo show a centered time when there's a long gap.
     let showTimeGap: Bool
-    var id: String { message.id }
+    /// Photos sent together (same `groupId`), drawn as one bubble; nil for a single message.
+    /// `message` is then the item carrying the caption (else the first).
+    var album: [Message]? = nil
+    /// The chat was opened with this many unread messages and they start here.
+    var unreadDivider: Int? = nil
+    var id: String { album?.first?.id ?? message.id }
+    /// Every message shown by this row.
+    var items: [Message] { album ?? [message] }
 }
 
 enum MessageGrouping {
-    static func rows(_ messages: [Message], groupWindow: TimeInterval = 5 * 60, gap: TimeInterval = 15 * 60) -> [MessageRow] {
+    static func rows(_ messages: [Message], unreadFrom: String? = nil, unreadCount: Int = 0,
+                     groupWindow: TimeInterval = 5 * 60, gap: TimeInterval = 15 * 60) -> [MessageRow] {
+        // Album items arrive as separate messages next to each other.
+        var units: [[Message]] = []
+        units.reserveCapacity(messages.count)
+        for m in messages {
+            if let g = m.groupId, !m.isDeleted, let last = units.last?.last, last.groupId == g, last.senderId == m.senderId, !last.isDeleted {
+                units[units.count - 1].append(m)
+            } else {
+                units.append([m])
+            }
+        }
+        func lead(_ u: [Message]) -> Message {
+            u.count > 1 ? (u.first { !($0.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } ?? u[0]) : u[0]
+        }
         var out: [MessageRow] = []
-        out.reserveCapacity(messages.count)
-        for (i, m) in messages.enumerated() {
-            let prev = i > 0 ? messages[i - 1] : nil
-            let next = i + 1 < messages.count ? messages[i + 1] : nil
-            let newDay = prev.map { Fmt.dayKey($0.date) != Fmt.dayKey(m.date) } ?? true
-            let bigGap = prev.map { m.date.timeIntervalSince($0.date) > gap } ?? true
+        out.reserveCapacity(units.count)
+        for (i, u) in units.enumerated() {
+            let m = lead(u)
+            let first = u[0]
+            let prev = i > 0 ? units[i - 1].last : nil
+            let next = i + 1 < units.count ? units[i + 1].first : nil
+            let newDay = prev.map { Fmt.dayKey($0.date) != Fmt.dayKey(first.date) } ?? true
+            let bigGap = prev.map { first.date.timeIntervalSince($0.date) > gap } ?? true
             func sameGroup(_ a: Message?, _ b: Message) -> Bool {
                 guard let a, a.kind != .system, b.kind != .system else { return false }
                 return a.senderId == b.senderId && a.fromMe == b.fromMe
                     && abs(b.date.timeIntervalSince(a.date)) < groupWindow
                     && Fmt.dayKey(a.date) == Fmt.dayKey(b.date)
             }
+            let last = u[u.count - 1]
             out.append(MessageRow(
                 message: m,
-                isFirstInGroup: !sameGroup(prev, m) || newDay,
-                isLastInGroup: next.map { !sameGroup(m, $0) || Fmt.dayKey($0.date) != Fmt.dayKey(m.date) } ?? true,
+                isFirstInGroup: !sameGroup(prev, first) || newDay,
+                isLastInGroup: next.map { !sameGroup(last, $0) || Fmt.dayKey($0.date) != Fmt.dayKey(last.date) } ?? true,
                 showDayHeader: newDay,
-                showTimeGap: bigGap))
+                showTimeGap: bigGap,
+                album: u.count > 1 ? u : nil,
+                unreadDivider: unreadFrom != nil && u.contains { $0.id == unreadFrom } ? unreadCount : nil))
         }
         return out
     }
@@ -48,22 +74,33 @@ enum MessageGrouping {
     }
 }
 
-/// Bottom-anchored message list with lazy history loading, shared by all platforms.
+/// Bottom-anchored message list with lazy history loading, shared by all platforms. A chat opens at its
+/// first unread message (or the newest one), stays hidden until it has landed so it never visibly jumps,
+/// and offers Telegram's arrow back down while history is being read.
 struct ChatScroll<Content: View>: View {
     let session: PlatformSession
     let chatId: String
     var spacing: CGFloat = 0
     var padding = EdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0)
     @ViewBuilder var content: ([MessageRow]) -> Content
-    /// Older pages load only after the chat has landed on its newest message; before that the top of
-    /// the lazy stack is briefly on screen and would page in history, leaving the view somewhere random.
+    /// Older pages load only after the chat has landed; before that the top of the lazy stack is briefly
+    /// on screen and would page in history, leaving the view somewhere random.
     @State private var settled = false
     /// Whether the reader is at the newest message; arrivals only follow then, so reading history isn't interrupted.
     @State private var atBottom = true
+    /// Kept invisible while the first scroll passes correct the lazy rows' estimated heights.
+    @State private var shown = false
+    @State private var unreadFrom: String?
+    @State private var unreadCount = 0
+    /// Messages that arrived while the reader was up in the history (the arrow's badge).
+    @State private var arrivedBelow = 0
+    /// Bottom-most visible row; the scroll view keeps it in place when pages are added above or rows below
+    /// get their real heights.
+    @State private var position: String?
 
     var body: some View {
         let messages = session.messages[chatId] ?? []
-        let rows = MessageGrouping.rows(messages)
+        let rows = MessageGrouping.rows(messages, unreadFrom: unreadFrom, unreadCount: unreadCount)
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(spacing: spacing) {
@@ -74,64 +111,44 @@ struct ChatScroll<Content: View>: View {
                     content(rows)
                     Color.clear.frame(height: 1).id("bottom")
                 }
+                .scrollTargetLayout()
                 .padding(padding)
             }
+            .scrollPosition(id: $position, anchor: .bottom)
             .defaultScrollAnchor(.bottom)
-            .modifier(KeepBottomOnResize())
-            .modifier(TrackBottom(atBottom: $atBottom))
-            .onChange(of: messages.last?.id) { _, _ in
+            .modifier(TrackBottom(atBottom: $atBottom) { if settled { proxy.scrollTo("bottom", anchor: .bottom) } })
+            .opacity(shown ? 1 : 0)
+            .overlay(alignment: .bottomTrailing) {
+                if settled && !atBottom {
+                    JumpToBottomButton(platform: session.platform, count: arrivedBelow) {
+                        arrivedBelow = 0
+                        jumpToBottom(proxy, rows: rows)
+                    }
+                    .padding(.trailing, 16).padding(.bottom, 14)
+                    .transition(.scale(scale: 0.6).combined(with: .opacity))
+                }
+            }
+            .animation(.easeOut(duration: 0.15), value: settled && !atBottom)
+            .onChange(of: atBottom) { _, bottom in if bottom { arrivedBelow = 0 } }
+            .onChange(of: messages.last?.id) { old, _ in
+                guard settled, old != nil, let last = messages.last else { return }
                 // Your own sends always jump down; arrivals follow while you're at the newest message.
-                guard !settled || atBottom || messages.last?.fromMe == true else { return }
+                guard atBottom || last.fromMe else {
+                    if !last.fromMe { arrivedBelow += 1 }
+                    return
+                }
                 Task {
                     // The new row gets its real height a layout pass or two later (images, link previews).
-                    for ms in [0, 120] as [UInt64] {
-                        try? await Task.sleep(nanoseconds: ms * 1_000_000)
-                        withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo("bottom", anchor: .bottom) }
-                    }
+                    withAnimation(.easeOut(duration: 0.15)) { proxy.scrollTo("bottom", anchor: .bottom) }
+                    try? await Task.sleep(nanoseconds: 160_000_000)
+                    proxy.scrollTo("bottom", anchor: .bottom)
                     atBottom = true
                 }
             }
-            .task(id: chatId) {
-                settled = false
-                atBottom = true
-                // A search result opened in a chat that was not on screen yet lands on that message instead.
-                let target = session.scrollTarget[chatId]
-                if target != nil { atBottom = false }
-                // Lazy rows get their real heights over a few layout passes after the first scroll.
-                for ms in [0, 80, 250, 600] as [UInt64] {
-                    try? await Task.sleep(nanoseconds: ms * 1_000_000)
-                    if Task.isCancelled { return }
-                    if let target {
-                        proxy.scrollTo(target, anchor: .center)
-                    } else if !messages.isEmpty || ms == 600 {
-                        proxy.scrollTo("bottom", anchor: .bottom)
-                    }
-                }
-                if session.messages[chatId]?.isEmpty == false { settled = true }
-                if target != nil, session.scrollTarget[chatId] == target { session.scrollTarget[chatId] = nil }
-            }
-            .onChange(of: messages.isEmpty) { _, empty in
-                guard !empty, !settled, session.scrollTarget[chatId] == nil else { return }
-                Task {
-                    for ms in [0, 80, 250] as [UInt64] {
-                        try? await Task.sleep(nanoseconds: ms * 1_000_000)
-                        proxy.scrollTo("bottom", anchor: .bottom)
-                    }
-                    settled = true
-                }
-            }
+            .task(id: chatId) { await land(proxy) }
             .onChange(of: session.scrollTarget[chatId]) { _, id in
-                guard let id else { return }
-                atBottom = false
-                Task {
-                    // Rows above the target settle their heights after the first jump (it may be pages back).
-                    for ms in [0, 150, 400] as [UInt64] {
-                        try? await Task.sleep(nanoseconds: ms * 1_000_000)
-                        guard session.scrollTarget[chatId] == id else { return }
-                        withAnimation(.easeInOut(duration: ms == 0 ? 0.25 : 0.12)) { proxy.scrollTo(id, anchor: .center) }
-                    }
-                    settled = true
-                }
+                guard let id, settled else { return }
+                Task { await jump(to: id, proxy) }
             }
             .overlay {
                 if messages.isEmpty && session.loadingHistory.contains(chatId) {
@@ -140,12 +157,212 @@ struct ChatScroll<Content: View>: View {
             }
         }
     }
+
+    /// Row showing a message (album items scroll to their album).
+    private func rowId(_ messageId: String) -> String {
+        let list = session.messages[chatId] ?? []
+        guard let i = list.firstIndex(where: { $0.id == messageId }) ?? list.firstIndex(where: { $0.groupId == messageId }),
+              let g = list[i].groupId else { return messageId }
+        var j = i
+        while j > 0, list[j - 1].groupId == g, list[j - 1].senderId == list[i].senderId { j -= 1 }
+        return list[j].id
+    }
+
+    private func land(_ proxy: ScrollViewProxy) async {
+        settled = false
+        shown = false
+        atBottom = true
+        arrivedBelow = 0
+        unreadFrom = nil
+        let unread = session.takeOpenedUnread(chatId)
+        // First open: the page comes from the bridge.
+        var waited = 0
+        while (session.messages[chatId] ?? []).isEmpty, waited < 200 {
+            if !session.loadingHistory.contains(chatId) && waited > 3 { break }
+            try? await Task.sleep(nanoseconds: 25_000_000)
+            if Task.isCancelled { return }
+            waited += 1
+        }
+        let target = session.scrollTarget[chatId]
+        if target == nil, unread > 0, let first = await session.firstUnread(chatId, count: unread) {
+            if Task.isCancelled { return }
+            unreadCount = unread
+            unreadFrom = first
+        }
+        let dest: (id: String, anchor: UnitPoint)
+        if let target { dest = (rowId(target), .center) }
+        else if let u = unreadFrom { dest = (rowId(u), UnitPoint(x: 0.5, y: 0.06)) }
+        else { dest = ("bottom", .bottom) }
+        if dest.id != "bottom" { atBottom = false }
+        // Lazy rows get their real heights over a few layout passes after the first scroll.
+        for ms in [0, 30, 50] as [UInt64] {
+            try? await Task.sleep(nanoseconds: ms * 1_000_000)
+            if Task.isCancelled { return }
+            proxy.scrollTo(dest.id, anchor: dest.anchor)
+        }
+        withAnimation(.easeOut(duration: 0.12)) { shown = true }
+        try? await Task.sleep(nanoseconds: 120_000_000)
+        if Task.isCancelled { return }
+        proxy.scrollTo(dest.id, anchor: dest.anchor)
+        settled = !(session.messages[chatId] ?? []).isEmpty || !session.loadingHistory.contains(chatId)
+        if target != nil, session.scrollTarget[chatId] == target { session.scrollTarget[chatId] = nil }
+        if !settled {
+            // The bridge was slow: land again once the first page is here.
+            while (session.messages[chatId] ?? []).isEmpty, session.loadingHistory.contains(chatId) {
+                try? await Task.sleep(nanoseconds: 50_000_000)
+                if Task.isCancelled { return }
+            }
+            for ms in [0, 60] as [UInt64] {
+                try? await Task.sleep(nanoseconds: ms * 1_000_000)
+                proxy.scrollTo("bottom", anchor: .bottom)
+            }
+            settled = true
+        }
+    }
+
+    /// Search results, pins and reply quotes: a short hop glides, a long one cuts straight there
+    /// (animating through hundreds of unmeasured rows is what made the chat flicker).
+    private func jump(to id: String, _ proxy: ScrollViewProxy) async {
+        let row = rowId(id)
+        atBottom = false
+        let rows = MessageGrouping.rows(session.messages[chatId] ?? [])
+        let near: Bool = {
+            guard let i = rows.firstIndex(where: { $0.id == row }), let p = position,
+                  let j = rows.firstIndex(where: { $0.id == p }) else { return false }
+            return abs(i - j) < 25
+        }()
+        if near {
+            withAnimation(.easeInOut(duration: 0.25)) { proxy.scrollTo(row, anchor: .center) }
+            try? await Task.sleep(nanoseconds: 300_000_000)
+        } else {
+            for ms in [0, 30, 90] as [UInt64] {
+                try? await Task.sleep(nanoseconds: ms * 1_000_000)
+                guard session.scrollTarget[chatId] == id else { return }
+                proxy.scrollTo(row, anchor: .center)
+            }
+        }
+        settled = true
+    }
+
+    private func jumpToBottom(_ proxy: ScrollViewProxy, rows: [MessageRow]) {
+        let far: Bool = {
+            guard let p = position, let j = rows.firstIndex(where: { $0.id == p }) else { return true }
+            return rows.count - j > 25
+        }()
+        if far {
+            proxy.scrollTo("bottom", anchor: .bottom)
+            Task {
+                try? await Task.sleep(nanoseconds: 40_000_000)
+                proxy.scrollTo("bottom", anchor: .bottom)
+                atBottom = true
+            }
+        } else {
+            withAnimation(.easeOut(duration: 0.25)) { proxy.scrollTo("bottom", anchor: .bottom) }
+            atBottom = true
+        }
+    }
+}
+
+/// The round arrow over the bottom-right of a chat scrolled up into its history, with the number of
+/// messages that came in meanwhile.
+struct JumpToBottomButton: View {
+    let platform: Platform
+    let count: Int
+    let action: () -> Void
+    @State private var hovered = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: platform == .messenger ? "arrow.down" : "chevron.down")
+                .font(.system(size: platform == .messenger ? 15 : 17, weight: .semibold))
+                .foregroundStyle(platform == .messenger ? tint : Color(hex: 0x8A9199))
+                .frame(width: 40, height: 40)
+                .background(Circle().fill(.white).shadow(color: .black.opacity(hovered ? 0.24 : 0.16), radius: 3, y: 1))
+                .overlay(alignment: .top) {
+                    if count > 0 {
+                        Text(count > 99 ? "99+" : "\(count)")
+                            .font(.system(size: 11.5, weight: .semibold)).foregroundStyle(.white)
+                            .padding(.horizontal, 5).frame(minWidth: 20, minHeight: 20)
+                            .background(Capsule().fill(tint))
+                            .offset(y: -10)
+                    }
+                }
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .focusEffectDisabled()
+        .onHover { hovered = $0 }
+        .help(platform == .telegram ? "Go to newest message" : "Tới tin nhắn mới nhất")
+    }
+
+    private var tint: Color {
+        switch platform {
+        case .telegram: TG.accent
+        case .whatsapp: Color(hex: 0x25D366)
+        case .messenger: Color(hex: 0x0866FF)
+        case .zalo: Color(hex: 0x0068FF)
+        }
+    }
+}
+
+/// Where the unread messages begin, drawn the way each app marks it.
+struct UnreadDivider: View {
+    let platform: Platform
+    let count: Int
+
+    var body: some View {
+        switch platform {
+        case .telegram:
+            Text("Unread Messages").font(.system(size: 13, weight: .medium)).foregroundStyle(Color(hex: 0x5F8A4E))
+                .frame(maxWidth: .infinity).padding(.vertical, 4)
+                .background(Color.white.opacity(0.85))
+                .padding(.vertical, 8)
+        case .whatsapp:
+            Text("\(count) TIN NHẮN CHƯA ĐỌC").font(.system(size: 12.5, weight: .medium)).foregroundStyle(Color(hex: 0x54656F))
+                .padding(.horizontal, 12).padding(.vertical, 5)
+                .background(Capsule().fill(.white.opacity(0.95)))
+                .frame(maxWidth: .infinity).padding(.vertical, 6)
+                .background(Color.white.opacity(0.35))
+                .padding(.vertical, 8)
+        case .zalo, .messenger:
+            HStack(spacing: 10) {
+                Rectangle().fill(divider).frame(height: 1)
+                Text(platform == .zalo ? "Tin nhắn chưa đọc" : "Tin nhắn mới").font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(platform == .zalo ? Color(hex: 0x0068FF) : Color(hex: 0x65676B)).fixedSize()
+                Rectangle().fill(divider).frame(height: 1)
+            }
+            .padding(.horizontal, 24).padding(.vertical, 10)
+        }
+    }
+
+    private var divider: Color { platform == .zalo ? Color(hex: 0x0068FF).opacity(0.45) : Color(hex: 0xCED0D4) }
+}
+
+extension View {
+    /// Hover buttons hung beside a bubble without taking any layout space, so showing them never squeezes,
+    /// rewraps or moves the bubble. They sit in the empty margin on the bubble's open side.
+    func besideBubble<A: View>(fromMe: Bool, spacing: CGFloat = 6, vertical: VerticalAlignment = .bottom,
+                               @ViewBuilder _ actions: () -> A) -> some View {
+        overlay(alignment: Alignment(horizontal: fromMe ? .leading : .trailing, vertical: vertical)) {
+            actions()
+                .fixedSize()
+                .alignmentGuide(fromMe ? HorizontalAlignment.leading : HorizontalAlignment.trailing) { d in
+                    fromMe ? d[.trailing] + spacing : d[.leading] - spacing
+                }
+        }
+    }
 }
 
 extension View {
     /// Flashes the row a search result just jumped to.
     func revealHighlight(_ session: PlatformSession, chatId: String, id: String) -> some View {
         modifier(RevealHighlight(on: session.highlighted[chatId] == id))
+    }
+
+    /// Also lights up an album when the target is any of its photos (or its hidden parent).
+    func revealHighlight(_ session: PlatformSession, chatId: String, row: MessageRow) -> some View {
+        let h = session.highlighted[chatId]
+        return modifier(RevealHighlight(on: h != nil && row.items.contains { $0.id == h || $0.groupId == h }))
     }
 }
 
@@ -157,33 +374,29 @@ private struct RevealHighlight: ViewModifier {
     }
 }
 
-/// Images loading and older pages arriving change the content height; anchoring those changes to the
-/// bottom keeps the messages on screen where they are instead of drifting.
-private struct KeepBottomOnResize: ViewModifier {
-    func body(content: Content) -> some View {
-        if #available(macOS 15.0, *) {
-            content.defaultScrollAnchor(.bottom, for: .sizeChanges)
-        } else {
-            content
-        }
-    }
-}
-
 /// Tracks whether the scroll view shows its last rows. Only scrolling clears the flag: content growing
 /// under a reader who is at the bottom (the new message itself) must not count as leaving it.
+/// The viewport shrinking (reply bar, a longer draft) keeps a reader at the bottom there via `onResize`.
 private struct TrackBottom: ViewModifier {
     @Binding var atBottom: Bool
+    var onResize: () -> Void
 
     private struct Edge: Equatable {
         var height: CGFloat
+        var viewport: CGFloat
         var near: Bool
     }
 
     func body(content: Content) -> some View {
         if #available(macOS 15.0, *) {
             content.onScrollGeometryChange(for: Edge.self) { g in
-                Edge(height: g.contentSize.height, near: g.visibleRect.maxY >= g.contentSize.height - 80)
+                Edge(height: g.contentSize.height, viewport: g.containerSize.height,
+                     near: g.visibleRect.maxY >= g.contentSize.height - 30)
             } action: { old, new in
+                if old.viewport != new.viewport {
+                    if atBottom && !new.near { onResize() }
+                    return
+                }
                 if new.near { atBottom = true } else if old.height == new.height { atBottom = false }
             }
         } else {
@@ -527,6 +740,131 @@ struct MediaContent: View {
         var h = w / aspect
         if h > heightLimit { h = heightLimit; w = h * aspect }
         return CGSize(width: max(w, 120), height: max(h, 80))
+    }
+}
+
+extension MessageRow {
+    /// Photos and videos of an album, in the order sent.
+    var albumMedia: [Message] { (album ?? []).filter { [.image, .video, .gif].contains($0.kind) } }
+    /// Files and other non-visual items sent in the same album.
+    var albumOthers: [Message] { (album ?? []).filter { ![.image, .video, .gif, .text].contains($0.kind) } }
+    /// The caption shown under an album (the item that carries text).
+    var albumCaption: String? {
+        guard album != nil, let t = message.text?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty else { return nil }
+        return message.text
+    }
+}
+
+/// Photos sent together, tiled into one block the way the apps lay out an album.
+struct AlbumGrid: View {
+    let session: PlatformSession
+    let items: [Message]
+    var width: CGFloat = 320
+    var spacing: CGFloat = 2
+    var cornerRadius: CGFloat = 0
+    @Environment(\.compactChat) private var compact
+
+    var body: some View {
+        let w = compact ? min(width, ChatMetrics.compactMediaWidth) : width
+        VStack(spacing: spacing) {
+            ForEach(Array(Self.rows(items.count).enumerated()), id: \.offset) { _, range in
+                let row = Array(items[range])
+                let tileW = (w - spacing * CGFloat(row.count - 1)) / CGFloat(row.count)
+                let h = row.count == 1 ? min(w / max(row[0].media?.aspect ?? 1.4, 0.6), w * 0.75) : tileW * (row.count == 2 ? 0.9 : 1)
+                HStack(spacing: spacing) {
+                    ForEach(row) { m in AlbumTile(session: session, message: m, size: CGSize(width: tileW, height: h)) }
+                }
+            }
+        }
+        .frame(width: w)
+        .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+    }
+
+    /// 2 side by side, 3 as one wide over two, then rows of three with pairs taking up the remainder.
+    static func rows(_ n: Int) -> [Range<Int>] {
+        var sizes: [Int]
+        switch n {
+        case 0: return []
+        case 1, 2: sizes = [n]
+        case 3: sizes = [1, 2]
+        case 4: sizes = [2, 2]
+        default:
+            sizes = Array(repeating: 3, count: n / 3)
+            switch n % 3 {
+            case 1: sizes[sizes.count - 1] = 2; sizes.append(2)
+            case 2: sizes.insert(2, at: 0)
+            default: break
+            }
+        }
+        var out: [Range<Int>] = []
+        var i = 0
+        for s in sizes { out.append(i..<(i + s)); i += s }
+        return out
+    }
+}
+
+private struct AlbumTile: View {
+    let session: PlatformSession
+    let message: Message
+    let size: CGSize
+
+    var body: some View {
+        let media = message.media ?? Media()
+        let source = media.path ?? media.url ?? media.thumbnail
+        ZStack {
+            RemoteImage(source: source, contentMode: .fill, maxPixel: max(size.width, size.height) * 2) {
+                if let thumb = media.thumbnail, thumb != source {
+                    RemoteImage(source: thumb, maxPixel: 96) { Color.gray.opacity(0.2) }.blur(radius: 6)
+                } else {
+                    Rectangle().fill(Color.gray.opacity(0.18))
+                }
+            }
+            .frame(width: size.width, height: size.height)
+            .clipped()
+            if message.kind == .video || message.kind == .gif {
+                Circle().fill(.black.opacity(0.45)).frame(width: 38, height: 38)
+                    .overlay(Image(systemName: "play.fill").foregroundStyle(.white).font(.system(size: 15)))
+            }
+        }
+        .frame(width: size.width, height: size.height)
+        .contentShape(Rectangle())
+        .onTapGesture { session.openMedia(message) }
+        .onAppear {
+            if media.path == nil && media.url == nil && Workspace.shared.storage.autoDownloads(message) {
+                session.ensureMedia(message)
+            }
+        }
+    }
+}
+
+/// A voice or video call in the history: the app's phone glyph and the bridge's line ("Cuộc gọi đi · 2 phút").
+struct CallContent: View {
+    let message: Message
+    var titleColor: Color = .primary
+    var subtitleColor: Color = .secondary
+    var font: (CGFloat, Font.Weight) -> Font = { .system(size: $0, weight: $1) }
+
+    var body: some View {
+        let text = message.text ?? ""
+        let lower = text.lowercased()
+        let missed = ["nhỡ", "missed", "declined", "từ chối", "bỏ lỡ", "cancel", "hủy"].contains { lower.contains($0) }
+        let video = lower.contains("video")
+        let lines = text.components(separatedBy: CharacterSet(charactersIn: "\n•·")).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        HStack(spacing: 10) {
+            Image(systemName: video ? "video.fill" : (message.fromMe ? "phone.arrow.up.right.fill" : "phone.arrow.down.left.fill"))
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(missed ? Color.red : titleColor.opacity(0.75))
+                .frame(width: 34, height: 34)
+                .background(Circle().fill((missed ? Color.red : titleColor).opacity(0.1)))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(lines.first ?? (message.fromMe ? "Cuộc gọi đi" : "Cuộc gọi đến")).font(font(14, .semibold))
+                    .foregroundStyle(missed ? Color.red : titleColor)
+                if lines.count > 1 {
+                    Text(lines.dropFirst().joined(separator: " · ")).font(font(12.5, .regular)).foregroundStyle(subtitleColor)
+                }
+            }
+        }
+        .fixedSize()
     }
 }
 

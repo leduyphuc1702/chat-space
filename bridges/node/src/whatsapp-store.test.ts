@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MAX_PINS, WAStore, editedContent, muteArg, muteEndMs, type PinEvent } from "./whatsapp-store.ts";
+import { MAX_PINS, WAStore, editedContent, keepContextInfo, muteArg, muteEndMs, type PinEvent } from "./whatsapp-store.ts";
 
 const quote = { stanzaId: "Q1", participant: "123@s.whatsapp.net", quotedMessage: { conversation: "original" } };
 
@@ -227,5 +227,83 @@ describe("pins", () => {
     expect(s.pins.has(CHAT)).toBe(false);
     s.reset();
     expect(s.pins.size).toBe(0);
+  });
+});
+
+describe("messageContextInfo survives rewrites of the content", () => {
+  const album = { messageSecret: "s", messageAssociation: { associationType: 1, parentMessageKey: { id: "ALBUM1" } } };
+
+  test("an edit that replaces the content wholesale keeps it", () => {
+    const old = { messageContextInfo: album, imageMessage: { caption: "a" } };
+    expect(editedContent(old, { conversation: "b" }).messageContextInfo).toEqual(album); // odd edit: content type changes
+    expect(editedContent(old, { conversation: "b" }).imageMessage.caption).toBe("b");
+    expect(editedContent({ messageContextInfo: album, conversation: "x" }, { extendedTextMessage: { text: "y" } }).messageContextInfo).toEqual(album);
+  });
+
+  test("the original's messageContextInfo (its secret, its album) stays whatever the edit carries", () => {
+    const out = editedContent({ messageContextInfo: album, conversation: "x" }, { conversation: "y", messageContextInfo: { messageSecret: "other" } });
+    expect(out.messageContextInfo).toEqual(album);
+    expect(out.conversation).toBe("y");
+  });
+
+  test("keepContextInfo fills a refreshed media message only when it has none", () => {
+    expect(keepContextInfo({ messageContextInfo: album, imageMessage: {} }, { imageMessage: { url: "new" } })).toEqual({ messageContextInfo: album, imageMessage: { url: "new" } });
+    expect(keepContextInfo({ imageMessage: {} }, { imageMessage: { url: "new" } })).toEqual({ imageMessage: { url: "new" } });
+    expect(keepContextInfo({ messageContextInfo: album }, undefined)).toBeUndefined();
+  });
+});
+
+describe("store keeps the album association", () => {
+  const dirs: string[] = [];
+  const open = (dir = mkdtempSync(join(tmpdir(), "wa-album-"))) => {
+    if (!dirs.includes(dir)) dirs.push(dir);
+    const s = new WAStore(dir, () => {});
+    s.load();
+    return { s, dir };
+  };
+  afterEach(() => {
+    for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
+  });
+  const CHAT = "g@g.us";
+  const child = (extra: any = {}) => ({
+    key: { remoteJid: CHAT, fromMe: false, id: "C1", participant: "1@s.whatsapp.net" },
+    messageTimestamp: 100,
+    message: { messageContextInfo: { messageAssociation: { associationType: 1, parentMessageKey: { id: "ALBUM1" } } }, imageMessage: { mimetype: "image/jpeg" } },
+    ...extra,
+  });
+
+  test("it is on disk after a restart", () => {
+    const a = open();
+    a.s.upsertRaw(CHAT, child());
+    a.s.flushSync();
+    const b = open(a.dir);
+    expect(b.s.getMsg(CHAT, "C1")!.raw.message.messageContextInfo.messageAssociation).toEqual({ associationType: 1, parentMessageKey: { id: "ALBUM1" } });
+  });
+
+  test("a later copy of the message without it (history sync after live) does not drop it", () => {
+    const { s } = open();
+    s.upsertRaw(CHAT, child());
+    s.upsertRaw(CHAT, child({ message: { imageMessage: { mimetype: "image/jpeg", url: "refreshed" } }, status: 3 }));
+    const raw = s.getMsg(CHAT, "C1")!.raw;
+    expect(raw.message.imageMessage.url).toBe("refreshed");
+    expect(raw.message.messageContextInfo.messageAssociation.parentMessageKey.id).toBe("ALBUM1");
+  });
+});
+
+describe("aliasesOf", () => {
+  const LID = "111@lid";
+  const LID2 = "222@lid";
+  const PN = "84901@s.whatsapp.net";
+
+  test("a LID and its phone jid know each other, device suffixes are ignored", () => {
+    const s = new WAStore(mkdtempSync(join(tmpdir(), "wa-alias-")), () => {});
+    expect(s.aliasesOf(LID)).toEqual([LID]); // nothing known yet
+    s.link(LID, PN);
+    expect(new Set(s.aliasesOf(LID))).toEqual(new Set([LID, PN]));
+    expect(new Set(s.aliasesOf("84901:12@s.whatsapp.net"))).toEqual(new Set([PN, LID]));
+    s.link(LID2, PN); // a second LID of the same person is picked up after the lookup was cached
+    expect(new Set(s.aliasesOf(PN))).toEqual(new Set([PN, LID, LID2]));
+    expect(s.aliasesOf("")).toEqual([]);
+    expect(s.aliasesOf("g@g.us")).toEqual(["g@g.us"]);
   });
 });

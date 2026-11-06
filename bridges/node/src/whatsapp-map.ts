@@ -2,6 +2,7 @@
 import { extractMessageContent, getContentType, isPnUser, jidDecode, proto } from "baileys";
 import { existsSync } from "node:fs";
 import type { Media, Message, MessageKind, Reaction } from "./types.ts";
+import { waJidUser } from "./mentions.ts";
 import { num, type PinEvent, type StoredMsg } from "./whatsapp-store.ts";
 
 export interface MapCtx {
@@ -11,6 +12,8 @@ export interface MapCtx {
   /** saved name / push name for a (canonical) jid, if known */
   nameOf(jid: string): string | undefined;
   groupSize(chatId: string): number | undefined;
+  /** Other spellings (LID / phone jid) of the same person; `@<number>` tokens in a text may use any of them. */
+  aliases?(jid: string): string[];
 }
 
 const Stub = proto.WebMessageInfo.StubType;
@@ -42,23 +45,107 @@ interface Decoded {
   text?: string;
   media?: Media;
   ci?: any;
+  /** URLs of the link preview (matchedText / canonicalUrl); mapMessage turns them into `links` once `text` is final */
+  previewUrls?: string[];
 }
 
+/**
+ * Content types that never show as a bubble: protocol traffic (edits, revokes, reactions, pins, key distribution,
+ * history/peer-data requests), encrypted add-ons we cannot read (poll votes, event responses, secret-encrypted edits,
+ * comments), the album parent (its photos are the album: see association()) and status / question / call plumbing.
+ */
 const HIDDEN = new Set([
   "protocolMessage",
   "reactionMessage",
   "encReactionMessage",
   "pollUpdateMessage",
   "senderKeyDistributionMessage",
+  "fastRatchetKeySenderKeyDistributionMessage",
   "keepInChatMessage",
   "pinInChatMessage",
   "encEventResponseMessage",
+  "encCommentMessage",
+  "secretEncryptedMessage",
   "messageHistoryBundle",
   "messageHistoryNotice",
   "requestPhoneNumberMessage",
   "peerDataOperationRequestMessage",
   "peerDataOperationRequestResponseMessage",
+  "albumMessage",
+  "stickerSyncRmrMessage",
+  "scheduledCallEditMessage",
+  "bcallMessage",
+  "limitSharingMessage",
+  "statusNotificationMessage",
+  "statusMentionMessage",
+  "groupStatusMentionMessage",
+  "statusQuestionAnswerMessage",
+  "statusQuotedMessage",
+  "statusStickerInteractionMessage",
+  "questionMessage",
+  "questionReplyMessage",
+  "questionResponseMessage",
+  "pollCreationOptionImageMessage",
 ]);
+
+/**
+ * Wrappers whose `.message` is the real content and that Baileys' extractMessageContent leaves alone (it unwraps
+ * ephemeral, view-once v1/v2/ext, document-with-caption, edited, associated-child and group-status itself).
+ */
+const WRAPPERS = new Set([
+  "deviceSentMessage",
+  "groupMentionedMessage",
+  "botInvokeMessage",
+  "botForwardedMessage",
+  "commentMessage",
+  "pollCreationMessageV4",
+]);
+
+/** Layers that hold the `messageContextInfo` of a message, outermost first (see association()). */
+const LAYERS = [
+  "ephemeralMessage",
+  "viewOnceMessage",
+  "viewOnceMessageV2",
+  "viewOnceMessageV2Extension",
+  "documentWithCaptionMessage",
+  "editedMessage",
+  "associatedChildMessage",
+  "groupStatusMessage",
+  "groupStatusMessageV2",
+  "deviceSentMessage",
+];
+
+const Assoc = proto.MessageAssociation.AssociationType;
+/**
+ * Companion uploads of a message that is already shown: the HD copy of a photo / video, the HEVC copy, the clip of a
+ * motion photo. WhatsApp's own apps fold them into the original; here they would be a second, identical bubble.
+ */
+const COMPANION = new Set<number>([Assoc.HD_IMAGE_DUAL_UPLOAD, Assoc.HD_VIDEO_DUAL_UPLOAD, Assoc.HEVC_VIDEO_DUAL_UPLOAD, Assoc.MOTION_PHOTO]);
+
+/**
+ * The association a message declares to another one (messageContextInfo.messageAssociation). Albums: every photo /
+ * video of the album points at the albumMessage that preceded it. The info sits at the top of the message or, for
+ * wrapped content, in any layer, so all of them are searched. Read from the stored raw message, so it works the same
+ * for live messages, history sync and a reloaded store.
+ */
+export function association(raw: any): { parentId: string; type: number } | undefined {
+  let m: any = raw?.message;
+  for (let i = 0; i < 6 && m; i++) {
+    const a = m.messageContextInfo?.messageAssociation;
+    if (a?.parentMessageKey?.id) {
+      const t = typeof a.associationType === "string" ? (Assoc as any)[a.associationType] : a.associationType;
+      return { parentId: String(a.parentMessageKey.id), type: num(t) };
+    }
+    const layer = LAYERS.find((k) => m[k]?.message);
+    m = layer ? m[layer].message : undefined;
+  }
+  return undefined;
+}
+
+const isCompanion = (raw: any): boolean => {
+  const a = association(raw);
+  return !!a && COMPANION.has(a.type);
+};
 
 function mediaOf(m: any, extra: Partial<Media> = {}): Media {
   const out: Media = {};
@@ -82,13 +169,32 @@ function vcardPhone(vcard?: string | null): string | undefined {
   return tel || undefined;
 }
 
+const str = (s: unknown): string | undefined => (typeof s === "string" && s.trim() ? s : undefined);
+const joinLines = (...parts: unknown[]): string | undefined => parts.map(str).filter(Boolean).join("\n") || undefined;
+/** The plain text of a nested proto message (a payment note). */
+const noteOf = (msg: any): string | undefined => str(msg?.conversation) ?? str(msg?.extendedTextMessage?.text);
+/** 12345 (thousandths) + "VND" -> "12.345 VND" */
+const money = (amount1000: unknown, currency?: string | null): string | undefined => {
+  const n = num(amount1000);
+  return n ? `${n / 1000}${currency ? ` ${currency}` : ""}` : undefined;
+};
+
+/** Text of an interactive / template card: its heading and body. */
+const cardText = (m: any): string | undefined => joinLines(m?.header?.title, m?.body?.text) ?? str(m?.footer?.text);
+
 /** Content (already unwrapped) -> kind/text/media. null = not user-visible. */
 function decode(content: any): Decoded | null {
-  if (!content) return null;
-  if (content.deviceSentMessage?.message) content = extractMessageContent(content.deviceSentMessage.message) ?? content;
-  const type = getContentType(content) as string | undefined;
-  if (!type) return null;
-  if (HIDDEN.has(type)) return null;
+  let type: string | undefined;
+  for (let hops = 0; ; hops++) {
+    if (!content) return null;
+    type = getContentType(content) as string | undefined;
+    if (!type || HIDDEN.has(type)) return null;
+    if (!WRAPPERS.has(type)) break;
+    // A wrapper without its inner message carries nothing to show.
+    const inner = content[type]?.message;
+    if (!inner || hops >= 3) return null;
+    content = extractMessageContent(inner);
+  }
   const m = content[type];
 
   switch (type) {
@@ -96,10 +202,10 @@ function decode(content: any): Decoded | null {
       return { kind: "text", text: String(m ?? "") };
 
     case "extendedTextMessage": {
-      const hasLink = !!(m.matchedText || m.canonicalUrl);
-      const out: Decoded = { kind: hasLink ? "link" : "text", text: m.text ?? "", ci: m.contextInfo };
-      if (hasLink) {
-        // No dedicated link field in the protocol: expose the preview image only, the URL is in `text`.
+      const previewUrls = [m.matchedText, m.canonicalUrl].filter((u): u is string => !!str(u));
+      const out: Decoded = { kind: previewUrls.length ? "link" : "text", text: m.text ?? "", ci: m.contextInfo };
+      if (previewUrls.length) {
+        out.previewUrls = previewUrls;
         const th = thumbUrl(m.jpegThumbnail);
         if (th) out.media = { thumbnail: th };
       }
@@ -136,7 +242,15 @@ function decode(content: any): Decoded | null {
       };
 
     case "stickerMessage":
+      // Lottie stickers (animations in WhatsApp's own .was format) cannot be drawn: say what the sticker shows instead.
+      if (m.isLottie || m.mimetype === "application/was") return lottieSticker(m);
       return { kind: "sticker", media: mediaOf(m, { mime: m.mimetype || "image/webp" }), ci: m.contextInfo };
+
+    case "lottieStickerMessage":
+      return lottieSticker(m?.message?.stickerMessage ?? {});
+
+    case "stickerPackMessage":
+      return { kind: "text", text: joinLines(`Sticker pack: ${m.name ?? ""}`.trim(), m.publisher), ci: m.contextInfo };
 
     case "locationMessage":
     case "liveLocationMessage": {
@@ -162,9 +276,16 @@ function decode(content: any): Decoded | null {
 
     case "pollCreationMessage":
     case "pollCreationMessageV2":
-    case "pollCreationMessageV3": {
+    case "pollCreationMessageV3":
+    case "pollCreationMessageV5": {
       const opts = (m.options ?? []).map((o: any) => `- ${o.optionName}`);
       return { kind: "unsupported", text: [`Poll: ${m.name ?? ""}`, ...opts].join("\n"), ci: m.contextInfo };
+    }
+
+    case "pollResultSnapshotMessage":
+    case "pollResultSnapshotMessageV3": {
+      const votes = (m.pollVotes ?? []).map((v: any) => `- ${v.optionName}: ${num(v.optionVoteCount)}`);
+      return { kind: "unsupported", text: [`Poll results: ${m.name ?? ""}`.trim(), ...votes].join("\n"), ci: m.contextInfo };
     }
 
     case "groupInviteMessage": {
@@ -177,24 +298,83 @@ function decode(content: any): Decoded | null {
     }
 
     case "eventMessage":
-      return { kind: "unsupported", text: `Event: ${m.name ?? ""}`.trim(), ci: m.contextInfo };
+      return { kind: "unsupported", text: `${m.isCanceled ? "Cancelled event" : "Event"}: ${m.name ?? ""}`.trim(), ci: m.contextInfo };
 
+    case "newsletterAdminInviteMessage":
+      return { kind: "text", text: joinLines(`Channel admin invitation: ${m.newsletterName ?? ""}`.trim(), m.caption), ci: m.contextInfo };
+    case "newsletterFollowerInviteMessageV2":
+      return { kind: "text", text: joinLines(`Channel invitation: ${m.newsletterName ?? ""}`.trim(), m.caption), ci: m.contextInfo };
+
+    // Replies to buttons / lists / cards. A response without anything to read is protocol traffic.
     case "buttonsResponseMessage":
-      return { kind: "text", text: m.selectedDisplayText || undefined, ci: m.contextInfo };
-    case "listResponseMessage":
-      return { kind: "text", text: m.title || undefined, ci: m.contextInfo };
     case "templateButtonReplyMessage":
-      return { kind: "text", text: m.selectedDisplayText || undefined, ci: m.contextInfo };
+      return visible({ kind: "text", text: str(m.selectedDisplayText), ci: m.contextInfo });
+    case "listResponseMessage":
+      return visible({ kind: "text", text: str(m.title) ?? str(m.singleSelectReply?.selectedRowId), ci: m.contextInfo });
+    case "interactiveResponseMessage":
+      return visible({ kind: "text", text: str(m.body?.text), ci: m.contextInfo });
+
     case "buttonsMessage":
       return { kind: "text", text: m.contentText || m.text || undefined, ci: m.contextInfo };
     case "listMessage":
       return { kind: "text", text: [m.title, m.description].filter(Boolean).join("\n") || undefined, ci: m.contextInfo };
     case "interactiveMessage":
-      return { kind: "text", text: m.body?.text || undefined, ci: m.contextInfo };
+      return { kind: "text", text: cardText(m) ?? "Interactive message", ci: m.contextInfo };
+    case "templateMessage": {
+      // Plain templates are already flattened by extractMessageContent; what is left is the interactive form.
+      const t = m.interactiveMessageTemplate;
+      return { kind: "text", text: (t && cardText(t)) ?? str(m.hydratedTemplate?.hydratedContentText) ?? "Template message", ci: m.contextInfo ?? t?.contextInfo };
+    }
+    case "highlyStructuredMessage": {
+      const text = str(m.hydratedHsm?.hydratedTemplate?.hydratedContentText) ?? str(m.fallbackLg) ?? str(m.deterministicLg);
+      return text ? { kind: "text", text } : { kind: "unsupported", text: unsupportedText(type) };
+    }
+    case "richResponseMessage": {
+      // Meta AI answer: the readable parts of its sections.
+      const text = joinLines(...(m.submessages ?? []).map((s: any) => s?.messageText));
+      return { kind: "text", text: text ?? "AI response", ci: m.contextInfo };
+    }
+
+    // Shop and payments: one readable line each.
+    case "orderMessage":
+      return { kind: "text", text: joinLines(`Order: ${m.orderTitle ?? ""}`.trim(), m.itemCount ? `${num(m.itemCount)} items` : undefined, money(m.totalAmount1000, m.totalCurrencyCode), m.message), ci: m.contextInfo };
+    case "productMessage": {
+      const p = m.product ?? {};
+      return { kind: "text", text: joinLines(`Product: ${p.title ?? ""}`.trim(), money(p.priceAmount1000, p.currencyCode), m.body, p.url), ci: m.contextInfo };
+    }
+    case "invoiceMessage":
+      return { kind: "text", text: joinLines("Invoice", m.note) };
+    case "requestPaymentMessage":
+      return { kind: "text", text: joinLines("Payment request", money(m.amount1000, m.currencyCodeIso4217), noteOf(m.noteMessage)) };
+    case "sendPaymentMessage":
+      return { kind: "text", text: joinLines("Payment sent", noteOf(m.noteMessage)) };
+    case "declinePaymentRequestMessage":
+      return { kind: "text", text: "Payment request declined" };
+    case "cancelPaymentRequestMessage":
+      return { kind: "text", text: "Payment request cancelled" };
+    case "paymentInviteMessage":
+      return { kind: "text", text: "Payment invitation" };
+
+    case "scheduledCallCreationMessage":
+      return { kind: "text", text: `Scheduled call: ${m.title ?? ""}`.trim() };
+
+    case "placeholderMessage":
+      // WhatsApp keeps the content of some messages (business broadcasts, marketing) off linked devices.
+      return { kind: "unsupported", text: "This message is not available here. Open WhatsApp on your phone to read it." };
 
     default:
-      return { kind: "unsupported", text: "Unsupported message", ci: m?.contextInfo };
+      return { kind: "unsupported", text: unsupportedText(type), ci: m?.contextInfo };
   }
+}
+
+/** Fallback text: names the content type so a report of it can be acted on. */
+const unsupportedText = (type: string): string => `Unsupported message (${type})`;
+
+/** A decoded message with nothing to show is not a message. */
+const visible = (d: Decoded): Decoded | null => (d.text ? d : null);
+
+function lottieSticker(s: any): Decoded {
+  return { kind: "unsupported", text: joinLines("Animated sticker", s?.accessibilityLabel), ci: s?.contextInfo };
 }
 
 /** Short label for a quoted message without text. */
@@ -222,12 +402,40 @@ function quoteLabel(d: Decoded): string | undefined {
   }
 }
 
+/**
+ * A tagged person is written in the text as `@<number>` (the user part of a phone jid or of a LID) and listed in
+ * contextInfo.mentionedJid. Show `@Name` instead: the contact / push name, the account's own name for yourself, a
+ * phone number as the last resort. A LID nobody can name stays as it is (a later sync can still resolve it, because
+ * this runs every time the message is mapped). Tokens of people who are not in `mentionedJid` are left alone.
+ */
+export function resolveMentions(text: string, mentionedJid: unknown, ctx: MapCtx): string {
+  if (!text || !Array.isArray(mentionedJid) || !mentionedJid.length || !text.includes("@")) return text;
+  const names = new Map<string, string>();
+  for (const j of mentionedJid) {
+    if (typeof j !== "string" || !j) continue;
+    const c = ctx.canon(j) || j;
+    const name = c === ctx.selfId ? ctx.selfName || "You" : ctx.nameOf(c) ?? (isPnUser(c) ? fallbackName(c) : undefined);
+    if (!name) continue;
+    // The text may spell the person differently from the jid (LID in one, phone number in the other).
+    for (const form of [j, c, ...(ctx.aliases?.(c) ?? [])]) {
+      const user = waJidUser(form);
+      if (user && !names.has(user)) names.set(user, name);
+    }
+  }
+  if (!names.size) return text;
+  // Only the users of this message's own mention list are looked for, longest first, and without word boundaries:
+  // people do type a digit right behind a tag ("@1234567890123452 tuan") and the number cannot be mistaken for another.
+  const users = [...names.keys()].sort((a, b) => b.length - a.length).map((u) => u.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  return text.replace(new RegExp(`@(${users.join("|")})`, "g"), (_, user: string) => `@${names.get(user)}`);
+}
+
 function replyOf(ci: any, ctx: MapCtx): Message["replyTo"] | undefined {
   if (!ci?.stanzaId) return undefined;
   const out: NonNullable<Message["replyTo"]> = { id: ci.stanzaId };
   const q = decode(extractMessageContent(ci.quotedMessage));
   if (q) {
-    const label = quoteLabel(q);
+    let label = quoteLabel(q);
+    if (label) label = resolveMentions(label, q.ci?.mentionedJid, ctx);
     if (label) out.text = label.length > 300 ? label.slice(0, 300) : label;
     out.kind = q.kind;
   }
@@ -432,10 +640,23 @@ export function isStorable(raw: any): boolean {
   if (content) {
     // A pin shows as a system line; an unpin leaves nothing in the chat.
     if (pinMessage(raw).pin) return !!pinEvent(raw)?.pin;
-    const t = getContentType(content);
-    return !!t && !HIDDEN.has(t);
+    if (isCompanion(raw)) return false;
+    return decode(content) !== null;
   }
   return raw.messageStubType != null && STORABLE_STUBS.has(num(raw.messageStubType));
+}
+
+/** `links` for a link preview whose URL the text does not contain (the app finds URLs that are written in the text). */
+function previewLinks(text: string, urls: string[]): { text: string; links?: NonNullable<Message["links"]> } {
+  const bare = (u: string) => u.trim().toLowerCase().replace(/^[a-z][a-z0-9+.-]*:\/\//, "").replace(/\/+$/, "");
+  const hay = text.toLowerCase();
+  if (urls.some((u) => hay.includes(bare(u)))) return { text };
+  // matchedText is what the sender typed; canonicalUrl is where it really goes.
+  const target = (urls[urls.length - 1] ?? "").trim();
+  const url = /^[a-z][a-z0-9+.-]*:/i.test(target) ? target : `https://${target}`;
+  // Nothing written to attach the link to: the URL is the text.
+  if (!text.trim()) return { text: url };
+  return { text, links: [{ offset: 0, length: text.length, url }] };
 }
 
 /** Map one stored message. Returns null for protocol-only / invisible messages. */
@@ -443,6 +664,7 @@ export function mapMessage(sm: StoredMsg, chatId: string, ctx: MapCtx): Message 
   const raw = sm.raw;
   const key = raw.key;
   if (!key?.id) return null;
+  if (isCompanion(raw)) return null; // HD / motion companion of a photo that is shown already
   const fromMe = !!key.fromMe;
   const isGroup = chatId.endsWith("@g.us");
   const senderId = fromMe ? ctx.selfId : isGroup ? ctx.canon(key.participant || raw.participant) || chatId : chatId;
@@ -477,7 +699,16 @@ export function mapMessage(sm: StoredMsg, chatId: string, ctx: MapCtx): Message 
   if (!d) return null;
 
   const out: Message = { ...base, kind: d.kind };
-  if (d.text) out.text = d.text;
+  let text = d.text ? resolveMentions(d.text, d.ci?.mentionedJid, ctx) : d.text;
+  if (d.previewUrls && text !== undefined) {
+    const p = previewLinks(text, d.previewUrls);
+    text = p.text;
+    if (p.links) out.links = p.links;
+  }
+  if (text) out.text = text;
+  // Album: every photo / video points at the albumMessage that opened it; the app draws messages with one groupId as one bubble.
+  const assoc = association(raw);
+  if (assoc?.type === Assoc.MEDIA_ALBUM) out.groupId = assoc.parentId;
   if (d.media) {
     out.media = d.media;
     if (sm.path && existsSync(sm.path)) {

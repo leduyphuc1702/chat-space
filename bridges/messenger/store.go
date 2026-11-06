@@ -110,12 +110,14 @@ type store struct {
 	jidChat  map[string]string // E2EE JID user -> chat id
 	deep     map[string]bool   // in-memory only: user paginated past the cap
 
+	avatars *avatarCache // profile pictures on disk, see avatars.go
+
 	saveMu    sync.Mutex
 	saveTimer *time.Timer
 }
 
 func newStore(dataDir string, log zerolog.Logger) *store {
-	s := &store{path: filepath.Join(dataDir, storeFileName), log: log}
+	s := &store{path: filepath.Join(dataDir, storeFileName), log: log, avatars: newAvatarCache(filepath.Join(dataDir, "avatars"))}
 	s.resetLocked()
 	return s
 }
@@ -171,6 +173,11 @@ func (s *store) load() error {
 	for chat, list := range f.Messages {
 		for _, m := range list {
 			s.msgChat[m.ID] = chat
+			// Older builds stored the catch-all text of an unmapped end-to-end encrypted
+			// payload as a plain text message; show it as what it is.
+			if m.Kind == "text" && m.SenderJID != "" && m.Text == legacyUnsupportedE2EEText {
+				m.Kind, m.Text = "unsupported", unsupportedE2EEText
+			}
 		}
 		s.msgs[chat] = list
 	}
@@ -188,6 +195,7 @@ func (s *store) reset() {
 	s.mu.Lock()
 	s.resetLocked()
 	s.mu.Unlock()
+	s.avatars.forget()
 	_ = os.Remove(s.path)
 }
 
@@ -529,6 +537,7 @@ func msgLess(a, b *storedMsg) bool {
 	return a.ID < b.ID
 }
 
+// snapshot copies a stored message exactly as it is stored (used for persistence).
 func snapshot(m *storedMsg) Message {
 	out := m.Message
 	if m.Media != nil {
@@ -541,6 +550,75 @@ func snapshot(m *storedMsg) Message {
 	}
 	if m.Reactions != nil {
 		out.Reactions = slices.Clone(m.Reactions)
+	}
+	if m.Links != nil {
+		out.Links = slices.Clone(m.Links)
+	}
+	return out
+}
+
+// view is what the app is told about a stored message: the snapshot with the sender's
+// name and picture filled in from the contact table as it is *now* (s.mu must be held).
+// The avatar used to be frozen into the message when it arrived, which left end-to-end
+// encrypted messages (no contact lookup at all) and messages that came before their
+// contact row without one, and let signed CDN URLs expire inside stored messages.
+func (s *store) view(m *storedMsg) Message {
+	out := snapshot(m)
+	s.decorate(&out)
+	return out
+}
+
+func (s *store) decorate(m *Message) {
+	if m.FromMe || m.SenderID == "" || m.SenderID == s.selfID {
+		return
+	}
+	stored := m.SenderAvatar
+	cands := make([]string, 0, 3)
+	if c := s.contacts[m.SenderID]; c != nil {
+		if c.Name != "" {
+			m.SenderName = c.Name
+		}
+		cands = append(cands, c.Avatar)
+	}
+	// In a one-to-one chat the other side's picture is also the chat's picture.
+	if t := s.threads[m.ChatID]; t != nil && !t.IsGroup && peerID(*t) == m.SenderID {
+		cands = append(cands, t.Avatar)
+	}
+	cands = append(cands, stored)
+	m.SenderAvatar = s.avatars.pick(m.SenderID, cands...)
+}
+
+// avatarFor picks the picture of a chat or member from candidate URLs (see avatarCache.pick).
+func (s *store) avatarFor(key string, candidates ...string) string {
+	return s.avatars.pick(key, candidates...)
+}
+
+// senderNameIn is the newest non-empty sender name the stored messages of a chat carry for
+// a user (end-to-end encrypted senders only have the push name that came with their
+// messages).
+func (s *store) senderNameIn(chat, user string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	list := s.msgs[chat]
+	for i := len(list) - 1; i >= 0; i-- {
+		if list[i].SenderID == user && !list[i].FromMe && list[i].SenderName != "" {
+			return list[i].SenderName
+		}
+	}
+	return ""
+}
+
+// senderNames maps user ids to the newest sender name stored for them in any chat.
+func (s *store) senderNames() map[string]string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := map[string]string{}
+	for _, list := range s.msgs {
+		for _, m := range list {
+			if m.SenderName != "" && !m.FromMe {
+				out[m.SenderID] = m.SenderName
+			}
+		}
 	}
 	return out
 }
@@ -597,6 +675,9 @@ func (s *store) putMessage(m *storedMsg) (isNew, changed bool, snap Message) {
 			if merged.WAMedia == nil {
 				merged.WAMedia = old.WAMedia
 			}
+			if merged.GroupID == "" {
+				merged.GroupID = old.GroupID // an album found out after the first part arrived
+			}
 			if merged.Status == "" || (old.Status == "read" && merged.Status != "read") {
 				merged.Status = old.Status
 			}
@@ -614,7 +695,7 @@ func (s *store) putMessage(m *storedMsg) (isNew, changed bool, snap Message) {
 			list[i] = &merged
 			after, _ := json.Marshal(&merged)
 			s.markDirty()
-			return false, !bytes.Equal(before, after), snapshot(&merged)
+			return false, !bytes.Equal(before, after), s.view(&merged)
 		}
 	}
 	cp := *m
@@ -622,7 +703,7 @@ func (s *store) putMessage(m *storedMsg) (isNew, changed bool, snap Message) {
 	s.insertLocked(chat, &cp)
 	s.trimLocked(chat)
 	s.markDirty()
-	return true, true, snapshot(&cp)
+	return true, true, s.view(&cp)
 }
 
 // mutateMessage applies fn to a stored message; ok=false when it is unknown.
@@ -643,7 +724,7 @@ func (s *store) mutateMessage(id string, fn func(m *storedMsg)) (snap Message, c
 		if !bytes.Equal(before, after) {
 			s.markDirty()
 		}
-		return snapshot(m), !bytes.Equal(before, after), true
+		return s.view(m), !bytes.Equal(before, after), true
 	}
 	return Message{}, false, false
 }
@@ -654,7 +735,7 @@ func (s *store) message(chat, id string) (storedMsg, bool) {
 	for _, m := range s.msgs[chat] {
 		if m.ID == id {
 			cp := *m
-			cp.Message = snapshot(m)
+			cp.Message = s.view(m)
 			return cp, true
 		}
 	}
@@ -754,7 +835,7 @@ func (s *store) lastMessage(chat string) *Message {
 	if len(list) == 0 {
 		return nil
 	}
-	snap := snapshot(list[len(list)-1])
+	snap := s.view(list[len(list)-1])
 	return &snap
 }
 
@@ -782,7 +863,7 @@ func (s *store) listMessages(chat, before string, limit int) (out []Message, fou
 	start := max(end-limit, 0)
 	out = make([]Message, 0, end-start)
 	for _, m := range list[start:end] {
-		out = append(out, snapshot(m))
+		out = append(out, s.view(m))
 	}
 	return out, true
 }
@@ -837,7 +918,7 @@ func (s *store) markOwnRead(chat string, upTo int64) (changed []Message) {
 	for _, m := range s.msgs[chat] {
 		if m.FromMe && m.Timestamp <= upTo && m.Status != "read" && m.Status != "failed" {
 			m.Status = "read"
-			changed = append(changed, snapshot(m))
+			changed = append(changed, s.view(m))
 		}
 	}
 	if len(changed) > 0 {

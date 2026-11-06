@@ -69,6 +69,10 @@ export abstract class Adapter {
   async chatMembers(_chatId: string): Promise<Member[]> {
     throw new BridgeError("unsupported", "chats.members is not supported");
   }
+  /** chats.direct (capability "direct_chat"): the 1:1 chat with a user, possibly empty. Must send nothing. */
+  async directChat(_userId: string): Promise<Chat> {
+    throw new BridgeError("unsupported", "direct chats are not supported");
+  }
   async react(_chatId: string, _messageId: string, _emoji: string): Promise<void> {
     throw new BridgeError("unsupported", "reactions are not supported");
   }

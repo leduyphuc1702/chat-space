@@ -43,7 +43,9 @@ import {
   type StorageConfig,
 } from "./types.ts";
 import {
+  AlbumClock,
   buildChat,
+  buildMentionEntities,
   entityName,
   hasProfilePhoto,
   isMinEntity,
@@ -51,13 +53,14 @@ import {
   mapFolders,
   mapMessage,
   mapReactions,
+  MENTION_REJECTED,
   muteInfo,
   muteUntilSeconds,
   notifyScopeOf,
   peerKey,
-  previewText,
   reactionEmoticonForTelegram,
-  replyTarget,
+  ReplyResolver,
+  searchFilters,
   userPresence,
   type Entity,
   type MapEnv,
@@ -87,6 +90,10 @@ const MEMBERS_TTL_MS = 5 * 60_000;
 const MEMBERS_LIMIT = 200;
 /** Pinned messages fetched per chat. */
 const PINS_LIMIT = 100;
+/** Telegram answers at most this many messages per messages.search / searchGlobal request. */
+const SEARCH_PAGE_LIMIT = 100;
+/** Server pages read for one search request and filter when results are narrowed afterwards. */
+const SEARCH_MAX_PAGES = 5;
 /**
  * updates.getDifference is asked to give up (DifferenceTooLong) past this many pending updates; the chat list is
  * then re-read instead, like the official apps do after a long absence. Below it every missed message is delivered
@@ -231,31 +238,6 @@ function parseMsgId(v: string): number {
 }
 
 /** Map that evicts its oldest entry once `max` is exceeded. */
-/** Telegram's server-side filter for the requested kinds; anything it cannot express is filtered after the fact. */
-function searchFilter(kinds?: string[]): Api.TypeMessagesFilter {
-  const k = new Set(kinds ?? []);
-  if (k.size === 2 && k.has("image") && k.has("video")) return new Api.InputMessagesFilterPhotoVideo();
-  if (k.size !== 1) return new Api.InputMessagesFilterEmpty();
-  switch ([...k][0]) {
-    case "image":
-      return new Api.InputMessagesFilterPhotos();
-    case "video":
-      return new Api.InputMessagesFilterVideo();
-    case "file":
-      return new Api.InputMessagesFilterDocument();
-    case "link":
-      return new Api.InputMessagesFilterUrl();
-    case "voice":
-      return new Api.InputMessagesFilterVoice();
-    case "audio":
-      return new Api.InputMessagesFilterMusic();
-    case "gif":
-      return new Api.InputMessagesFilterGif();
-    default:
-      return new Api.InputMessagesFilterEmpty();
-  }
-}
-
 class BoundedMap<K, V> extends Map<K, V> {
   constructor(private readonly max: number) {
     super();
@@ -437,7 +419,7 @@ type RawUpdate = { _entities?: Map<string, Entity> };
 export class TelegramAdapter extends Adapter {
   readonly platform = "telegram";
   // "edit" is deliberately absent: the protocol has no edit method yet.
-  readonly capabilities = ["reactions", "reply", "delete", "edit", "typing", "read_receipts", "media_send", "voice", "folders", "mentions", "forward", "search", "mute", "pins", "bot_buttons"];
+  readonly capabilities = ["reactions", "reply", "delete", "edit", "typing", "read_receipts", "media_send", "voice", "folders", "mentions", "forward", "search", "mute", "pins", "bot_buttons", "direct_chat"];
 
   private creds?: Creds;
   private client?: TelegramClient;
@@ -469,6 +451,14 @@ export class TelegramAdapter extends Adapter {
   /** Non-channel message ids are account-global, so deletions can be attributed to a chat. */
   private readonly idToChat = new BoundedMap<number, string>(50000);
   private readonly sentKeys = new BoundedMap<string, true>(500);
+  /** Keeps the items of an album in sequence (they share one `date` in whole seconds). */
+  private readonly albums = new AlbumClock();
+  /** Fills `replyTo` of mapped messages: from the page, from `recent`, from past lookups, else one batched fetch. */
+  private readonly replies = new ReplyResolver({
+    recent: (chatId, id) => this.recent.get(`${chatId}:${id}`),
+    fetch: (chatId, ids) => this.fetchReplyTargets(chatId, ids),
+    log: (m) => this.ctx.log(m),
+  });
   private readonly typingTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly avatarInflight = new Map<string, Promise<string | undefined>>();
   private readonly avatarSlots = new Limiter(4);
@@ -680,6 +670,7 @@ export class TelegramAdapter extends Adapter {
     this.recent.clear();
     this.idToChat.clear();
     this.sentKeys.clear();
+    this.replies.clear();
     this.membersCache.clear();
     this.pinsCache.clear();
     this.pinsEpoch++;
@@ -1344,7 +1335,7 @@ export class TelegramAdapter extends Adapter {
       const entity = local.get(key) ?? this.entities.get(key);
       if (!entity) continue;
       const raw = msgs.get(`${key}:${d.topMessage}`);
-      const last = raw ? mapMessage(raw, env) : undefined;
+      const last = raw ? this.mapRaw(raw) : undefined;
       if (last) this.rememberMessage(last);
       const scope = notifyScopeOf(entity);
       const chat = buildChat(entity, d, last, env, this.notifyScope.get(scope));
@@ -1564,6 +1555,12 @@ export class TelegramAdapter extends Adapter {
 
   // -------------------------------------------------------------- messages
 
+  /** TL message -> protocol message (entities resolved, album items kept in sequence). */
+  private mapRaw(raw: RawMessage, opts?: { forceOut?: boolean }): Message | undefined {
+    const msg = mapMessage(raw, this.mapEnv(), opts);
+    return msg ? this.albums.stamp(msg) : undefined;
+  }
+
   private async toProtocol(raw: RawMessage, opts?: { forceOut?: boolean }): Promise<Message | undefined> {
     if (raw instanceof Api.Message || raw instanceof Api.MessageService) {
       let senderKey: string | undefined;
@@ -1571,47 +1568,41 @@ export class TelegramAdapter extends Adapter {
       else if (raw.peerId instanceof Api.PeerUser && !raw.out) senderKey = peerKey(raw.peerId);
       if (senderKey && !this.entities.has(senderKey)) await this.ensureEntity(senderKey);
     }
-    return mapMessage(raw, this.mapEnv(), opts);
+    return this.mapRaw(raw, opts);
   }
 
-  /** Fill replyTo.text/senderName/kind from the batch, the recent-message cache, or one extra fetch. */
-  private async fillReplies(chatId: string, raws: RawMessage[], mapped: Message[]) {
-    const want = new Set<number>();
-    for (const raw of raws) {
-      const t = replyTarget(raw, chatId);
-      if (t !== undefined) want.add(t);
+  /** One getMessages call for the replied-to messages `ids` of a chat; returns the ones that still exist. */
+  private async fetchReplyTargets(chatId: string, ids: number[]): Promise<Map<number, Message>> {
+    const client = this.requireClient();
+    const peer = await this.inputPeer(chatId);
+    const fetched = await client.getMessages(peer, { ids });
+    const found = new Map<number, Message>();
+    for (const raw of fetched) {
+      if (!raw) continue; // deleted (MessageEmpty) or from another chat
+      this.rememberEntities((raw as unknown as RawUpdate)._entities);
+      const m = await this.toProtocol(raw);
+      if (m) found.set(Number(m.id), m);
     }
-    if (want.size === 0) return;
+    return found;
+  }
 
-    const known = new Map<number, Message>();
-    for (const m of mapped) known.set(Number(m.id), m);
-    for (const id of want) {
-      const hit = this.recent.get(`${chatId}:${id}`);
-      if (hit && !known.has(id)) known.set(id, hit);
-    }
-    const missing = [...want].filter((id) => !known.has(id)).slice(0, 100);
-    if (missing.length > 0 && this.client) {
-      try {
-        const peer = await this.inputPeer(chatId);
-        const fetched = await this.client.getMessages(peer, { ids: missing });
-        for (const raw of fetched) {
-          if (!raw) continue;
-          this.rememberEntities((raw as unknown as RawUpdate)._entities);
-          const m = await this.toProtocol(raw);
-          if (m) known.set(Number(m.id), m);
-        }
-      } catch (e) {
-        this.ctx.log(`could not resolve replied-to messages in ${chatId}: ${describeError(e)}`);
-      }
-    }
-    for (const m of mapped) {
-      if (!m.replyTo) continue;
-      const target = known.get(Number(m.replyTo.id));
-      if (!target) continue;
-      if (!m.replyTo.text) m.replyTo.text = previewText(target);
-      if (target.senderName) m.replyTo.senderName = target.senderName;
-      m.replyTo.kind = target.kind;
-    }
+  /**
+   * Fill replyTo.text/senderName/kind of `mapped` (made from `raws`, same order) with the message each one answers:
+   * from the same page, from messages seen before, from earlier lookups, else one batched fetch for all that are missing.
+   */
+  private fillReplies(chatId: string, raws: RawMessage[], mapped: Message[]): Promise<void> {
+    return this.replies.fill(chatId, raws, mapped);
+  }
+
+  /**
+   * `message.update` replaces the whole message in the app, so a re-mapped message must not lose its quote: take the
+   * resolved `replyTo` of the version we sent before (when it still points at the same message and was resolved),
+   * otherwise resolve it again.
+   */
+  private async keepOrFillReply(msg: Message, raw: RawMessage, prev: Message | undefined) {
+    if (!msg.replyTo) return;
+    if (prev?.replyTo && prev.replyTo.id === msg.replyTo.id && prev.replyTo.kind) msg.replyTo = prev.replyTo;
+    else await this.fillReplies(msg.chatId, [raw], [msg]);
   }
 
   async listMessages(chatId: string, limit: number, before?: string): Promise<Message[]> {
@@ -1651,51 +1642,93 @@ export class TelegramAdapter extends Adapter {
   /**
    * messages.search: Telegram's own server search (one chat, or every chat with SearchGlobal), plus the messages this
    * bridge has seen recently, matched accent-insensitively so "hop dong" also finds "hợp đồng" there.
+   *
+   * `kinds` become server filters (see `searchFilters`; several kinds with no common filter are several requests,
+   * merged). `senderId` becomes `fromId` of messages.search, so "everything this member sent / shared in this chat" is
+   * answered by the server; SearchGlobal has no sender filter, so without `chatId` the sender is checked afterwards.
+   * Whatever the server cannot narrow (a document filter also returns videos sent as files, …) is checked afterwards
+   * and the next server page is read to fill the result, so a page is short only when the history really ends.
    */
   async searchMessages(p: SearchParams): Promise<Message[]> {
     const client = this.requireClient();
     return this.guard(async () => {
-      const filter = searchFilter(p.kinds);
+      const filters = searchFilters(p.kinds);
       const maxDate = p.before ? Math.floor(p.before / 1000) : 0;
-      const r = p.chatId
-        ? await client.invoke(
-            new Api.messages.Search({
-              peer: await this.inputPeer(p.chatId),
-              q: p.query,
-              filter,
-              minDate: 0,
-              maxDate,
-              offsetId: 0,
-              addOffset: 0,
-              limit: p.limit,
-              maxId: 0,
-              minId: 0,
-              hash: helpers.returnBigInt(0),
-            }),
-          )
-        : await client.invoke(
-            new Api.messages.SearchGlobal({
-              q: p.query,
-              filter,
-              minDate: 0,
-              maxDate,
-              offsetRate: 0,
-              offsetPeer: new Api.InputPeerEmpty(),
-              offsetId: 0,
-              limit: p.limit,
-            }),
-          );
-      const out: Message[] = [];
-      if (!(r instanceof Api.messages.MessagesNotModified)) {
-        for (const e of [...r.users, ...r.chats]) this.rememberEntity(e as Entity);
-        // The server already matched the words its own way; only the kind and page bounds are checked here.
-        const bounds = new Matcher({ ...p, query: "" });
-        for (const raw of r.messages) {
-          const m = await this.toProtocol(raw as RawMessage);
-          if (!m || (p.kinds && !bounds.test(m))) continue;
-          this.rememberMessage(m);
-          out.push(m);
+      const serverLimit = Math.min(p.limit, SEARCH_PAGE_LIMIT);
+      const peer = p.chatId ? await this.inputPeer(p.chatId) : undefined;
+      let from: Api.TypeInputPeer | undefined;
+      if (peer && p.senderId) {
+        try {
+          from = await this.inputPeer(p.senderId);
+        } catch {
+          from = undefined; // sender not known to this session: the server cannot filter, the check below does
         }
+      }
+      const bounds = new Matcher({ ...p, query: "" });
+      const boundsAnyKind = new Matcher({ ...p, query: "", kinds: undefined }); // for the server's Url filter
+
+      const read = async (filter: Api.TypeMessagesFilter): Promise<Message[]> => {
+        const accept = filter instanceof Api.InputMessagesFilterUrl ? boundsAnyKind : bounds;
+        const got: Message[] = [];
+        let offsetId = 0;
+        let offsetRate = 0;
+        let offsetPeer: Api.TypeInputPeer = new Api.InputPeerEmpty();
+        for (let page = 0; page < SEARCH_MAX_PAGES && got.length < p.limit; page++) {
+          const r = peer
+            ? await client.invoke(
+                new Api.messages.Search({
+                  peer,
+                  q: p.query,
+                  fromId: from,
+                  filter,
+                  minDate: 0,
+                  maxDate,
+                  offsetId,
+                  addOffset: 0,
+                  limit: serverLimit,
+                  maxId: 0,
+                  minId: 0,
+                  hash: helpers.returnBigInt(0),
+                }),
+              )
+            : await client.invoke(
+                new Api.messages.SearchGlobal({
+                  q: p.query,
+                  filter,
+                  minDate: 0,
+                  maxDate,
+                  offsetRate,
+                  offsetPeer,
+                  offsetId,
+                  limit: serverLimit,
+                }),
+              );
+          if (r instanceof Api.messages.MessagesNotModified) break;
+          for (const e of [...r.users, ...r.chats]) this.rememberEntity(e as Entity);
+          const raws = r.messages as RawMessage[];
+          for (const raw of raws) {
+            const m = await this.toProtocol(raw);
+            if (!m || !accept.test(m)) continue;
+            this.rememberMessage(m);
+            got.push(m);
+          }
+          const last = raws[raws.length - 1] as { id?: number; peerId?: Api.TypePeer } | undefined;
+          if (raws.length < serverLimit || !last?.id) break; // the server has no more
+          offsetId = last.id;
+          if (!peer) {
+            if (!(r instanceof Api.messages.MessagesSlice) || r.nextRate === undefined || !last.peerId) break;
+            offsetRate = r.nextRate;
+            offsetPeer = await this.inputPeer(peerKey(last.peerId));
+          }
+        }
+        return got;
+      };
+
+      const out: Message[] = [];
+      // SearchGlobal rejects "no text and no filter"; with only a sender and no chat the local matches are all there is.
+      const everything = filters.length === 1 && filters[0] instanceof Api.InputMessagesFilterEmpty;
+      if (peer || p.query || !everything) {
+        for (const list of await Promise.all(filters.map(read))) out.push(...list);
       }
       const local = new Matcher(p);
       for (const m of this.recent.values()) {
@@ -1706,21 +1739,37 @@ export class TelegramAdapter extends Adapter {
   }
 
   /**
-   * Mention spans -> MessageEntityMentionName entities (offsets are UTF-16 like ours). A user we cannot resolve to an
-   * input user is skipped: the text is still sent, just without that highlight.
+   * Mention spans -> InputMessageEntityMentionName entities (offsets are UTF-16 like ours). The entity needs the
+   * user's InputUser with access hash, which `inputPeer` has for everyone we have seen (members of the chat, senders).
+   * A user we cannot resolve is skipped: the text is still sent, just without that highlight.
    */
-  private async mentionEntities(text: string, raw: unknown): Promise<Api.TypeMessageEntity[] | undefined> {
-    const entities: Api.TypeMessageEntity[] = [];
-    for (const m of sanitizeMentions(text, raw)) {
-      if (!/^\d+$/.test(m.userId)) continue;
+  private mentionEntities(text: string, raw: unknown): Promise<Api.TypeMessageEntity[] | undefined> {
+    return buildMentionEntities(text, raw, async (userId) => {
       try {
-        const userId = utils.getInputUser(await this.inputPeer(m.userId));
-        entities.push(new Api.InputMessageEntityMentionName({ offset: m.offset, length: m.length, userId }));
+        return utils.getInputUser(await this.inputPeer(userId));
       } catch (e) {
-        this.ctx.log(`mention of ${m.userId} skipped: ${describeError(e)}`);
+        this.ctx.log(`mention of ${userId} skipped: ${describeError(e)}`);
+        return undefined;
       }
+    });
+  }
+
+  /**
+   * Runs `send` with the mention entities. If Telegram refuses one of them (a user whose access hash it does not
+   * accept, bad bounds) the message goes out again with the same text and no entities, as the protocol promises
+   * ("just without that highlight"); `[]` rather than `undefined` so GramJS does not Markdown-parse the text.
+   */
+  private async withMentionFallback<T>(
+    entities: Api.TypeMessageEntity[] | undefined,
+    send: (entities: Api.TypeMessageEntity[] | undefined) => Promise<T>,
+  ): Promise<T> {
+    try {
+      return await send(entities);
+    } catch (e) {
+      if (!entities || !MENTION_REJECTED.has(rpcMessage(e))) throw e;
+      this.ctx.log(`Telegram refused the mention (${rpcMessage(e)}); sending the text without highlights`);
+      return send([]);
     }
-    return entities.length ? entities : undefined;
   }
 
   async sendMessage(p: {
@@ -1738,19 +1787,18 @@ export class TelegramAdapter extends Adapter {
       // (a message with mentions is therefore sent as plain text plus the mention entities).
       const formattingEntities = await this.mentionEntities(p.text ?? "", p.mentions);
 
-      let sent: Api.Message;
-      if (p.filePath) {
+      const send = (entities: Api.TypeMessageEntity[] | undefined): Promise<Api.Message> => {
+        if (!p.filePath) return client.sendMessage(peer, { message: p.text ?? "", replyTo, formattingEntities: entities });
         if (!safeStat(p.filePath)?.isFile()) throw new BridgeError("invalid_params", `file not found: ${p.filePath}`);
-        sent = await client.sendFile(peer, {
+        return client.sendFile(peer, {
           file: p.filePath,
           caption: p.text || undefined,
           replyTo,
-          formattingEntities,
+          formattingEntities: entities,
           voiceNote: VOICE_EXT.has(extname(p.filePath).toLowerCase()),
         });
-      } else {
-        sent = await client.sendMessage(peer, { message: p.text ?? "", replyTo, formattingEntities });
-      }
+      };
+      const sent = await this.withMentionFallback(formattingEntities, send);
       return this.recordSent(sent);
     });
   }
@@ -1772,7 +1820,7 @@ export class TelegramAdapter extends Adapter {
     if (!sent) throw new BridgeError("internal", "Telegram did not return the sent message");
 
     this.rememberEntities((sent as unknown as RawUpdate)._entities);
-    const msg = mapMessage(sent, this.mapEnv(), { forceOut: true });
+    const msg = this.mapRaw(sent, { forceOut: true });
     if (!msg) throw new BridgeError("internal", "Telegram returned an unreadable message");
     await this.fillReplies(msg.chatId, [sent], [msg]);
 
@@ -1948,6 +1996,81 @@ export class TelegramAdapter extends Adapter {
     );
   }
 
+  /**
+   * chats.direct (capability "direct_chat"): the one-to-one chat with a user seen in a group (`Message.senderId`).
+   * A dialog we already know is returned as is; otherwise the server is asked for the dialog (read-only
+   * messages.getPeerDialogs), and a user without one gets an empty chat built from the entity. Nothing is sent or
+   * created: the chat exists on Telegram once a first message is sent. `chat.id` is the user id, which is what
+   * messages.list / messages.send resolve through the access hash (or message reference) learned here.
+   */
+  async directChat(userId: string): Promise<Chat> {
+    this.requireClient();
+    if (!/^\d+$/.test(userId)) throw new BridgeError("invalid_params", `not a Telegram user id: ${userId}`);
+    return this.guard(async () => {
+      const known = this.chats.get(userId);
+      if (known) return known;
+
+      const user = await this.resolveUser(userId);
+      if (user.deleted) throw new BridgeError("not_found", "This Telegram account has been deleted");
+
+      let chat: Chat | undefined;
+      try {
+        chat = await this.refreshDialog(userId, false); // the real dialog, if there is one (registers it in the cache)
+      } catch (e) {
+        if (isAuthError(e)) throw e;
+        this.ctx.log(`could not look up the dialog with ${userId}: ${describeError(e)}`);
+      }
+      if (chat?.id === userId) return chat;
+
+      const scope = notifyScopeOf(user);
+      const built = buildChat(user, undefined, undefined, this.mapEnv(), this.notifyScope.get(scope));
+      if (!built) throw new BridgeError("not_found", `Unknown user ${userId}`);
+      this.chatScope.set(built.id, scope);
+      this.chats.set(built.id, built); // later messages, mute and read state find it like any other chat
+      return built;
+    });
+  }
+
+  /**
+   * A user entity whose input peer we can address. Group participants and message senders usually arrive with an
+   * access hash (`inputPeers`); a "min" user from a busy supergroup does not, and is then looked up through a
+   * message of that group that shows them (InputUserFromMessage, as the official clients do).
+   */
+  private async resolveUser(userId: string): Promise<Api.User> {
+    const client = this.requireClient();
+    const usable = () => {
+      const u = this.entities.get(userId);
+      return u instanceof Api.User && this.inputPeers.has(userId) ? u : undefined;
+    };
+    const have = usable();
+    if (have) return have;
+    if (!(this.entities.get(userId) instanceof Api.User)) await this.ensureEntity(userId);
+    const got = usable();
+    if (got) return got;
+
+    let seen: Message | undefined;
+    for (const m of this.recent.values()) if (!m.fromMe && m.senderId === userId && m.chatId.startsWith("-")) seen = m;
+    if (seen) {
+      try {
+        const peer = await this.inputPeer(seen.chatId);
+        const msgId = Number(seen.id);
+        const users = await client.invoke(
+          new Api.users.GetUsers({ id: [new Api.InputUserFromMessage({ peer, msgId, userId: helpers.returnBigInt(userId) })] }),
+        );
+        for (const e of users) this.rememberEntity(e as Entity);
+        if (!this.inputPeers.has(userId)) {
+          this.inputPeers.set(userId, new Api.InputPeerUserFromMessage({ peer, msgId, userId: helpers.returnBigInt(userId) }));
+        }
+      } catch (e) {
+        if (isAuthError(e)) throw e;
+        this.ctx.log(`could not resolve user ${userId} through a message: ${describeError(e)}`);
+      }
+    }
+    const u = this.entities.get(userId);
+    if (u instanceof Api.User && this.inputPeers.has(userId)) return u;
+    throw new BridgeError("not_found", `Unknown user ${userId}`);
+  }
+
   /** Re-fetch one message and emit message.update (used after our own reaction). */
   private async refreshMessage(chatId: string, id: number) {
     const client = this.requireClient();
@@ -1957,8 +2080,7 @@ export class TelegramAdapter extends Adapter {
     this.rememberEntities((raw as unknown as RawUpdate)._entities);
     const msg = await this.toProtocol(raw);
     if (!msg) return;
-    const prev = this.recent.get(`${chatId}:${id}`);
-    if (prev?.replyTo && msg.replyTo?.id === prev.replyTo.id) msg.replyTo = prev.replyTo;
+    await this.keepOrFillReply(msg, raw, this.recent.get(`${chatId}:${id}`));
     this.rememberMessage(msg);
     this.ctx.emit("message.update", { message: msg });
   }
@@ -1980,7 +2102,10 @@ export class TelegramAdapter extends Adapter {
     return this.guard(async () => {
       const peer = await this.inputPeer(chatId);
       const formattingEntities = await this.mentionEntities(text, mentions);
-      const edited = await client.editMessage(peer, { message: parseMsgId(messageId), text, formattingEntities });
+      const id = parseMsgId(messageId);
+      const edited = await this.withMentionFallback(formattingEntities, (entities) =>
+        client.editMessage(peer, { message: id, text, formattingEntities: entities }),
+      );
       this.rememberEntities((edited as unknown as RawUpdate)._entities);
       const msg = await this.onEdit(edited, { forceOut: true });
       if (!msg) throw new BridgeError("internal", "Telegram returned an unreadable message");
@@ -2965,9 +3090,8 @@ export class TelegramAdapter extends Adapter {
   private async onEdit(raw: RawMessage, opts?: { forceOut?: boolean }): Promise<Message | undefined> {
     const msg = await this.toProtocol(raw, opts);
     if (!msg) return undefined;
-    const prev = this.recent.get(`${msg.chatId}:${msg.id}`);
-    if (prev?.replyTo && msg.replyTo?.id === prev.replyTo.id) msg.replyTo = prev.replyTo;
-    else await this.fillReplies(msg.chatId, [raw], [msg]);
+    await this.keepOrFillReply(msg, raw, this.recent.get(`${msg.chatId}:${msg.id}`));
+    this.replies.forget(msg.chatId, msg.id); // what a later reply to this message quotes has changed
     this.rememberMessage(msg);
     this.ctx.emit("message.update", { message: msg });
     this.pinnedMessageChanged(msg.chatId, msg.id);
@@ -2987,6 +3111,7 @@ export class TelegramAdapter extends Adapter {
       const cid = chatId ?? this.idToChat.get(id);
       if (!cid) continue; // never seen this message in this process: cannot attribute it
       this.recent.delete(`${cid}:${id}`);
+      this.replies.forget(cid, id);
       this.ctx.emit("message.delete", { chatId: cid, messageId: String(id) });
       this.pinnedMessageChanged(cid, String(id));
       if (this.chats.get(cid)?.lastMessage?.id === String(id)) refresh.add(cid);

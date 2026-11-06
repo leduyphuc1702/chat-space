@@ -6,6 +6,8 @@ export interface SearchParams {
   /** Every word must appear (case, accent and đ/d insensitive); empty = any message of `kinds`. */
   query: string;
   chatId?: string;
+  /** Only messages from this sender (platform user id). On its own (no query, no kinds) it lists everything they wrote. */
+  senderId?: string;
   kinds?: MessageKind[];
   /** Only messages strictly older than this (ms epoch): the next page. */
   before?: number;
@@ -17,11 +19,12 @@ const KINDS = new Set<string>(["text", "image", "video", "audio", "voice", "file
 export function parseSearch(p: Record<string, any>): SearchParams {
   const query = typeof p.query === "string" ? p.query.trim() : "";
   const kinds = Array.isArray(p.kinds) ? (p.kinds.filter((k: unknown) => typeof k === "string" && KINDS.has(k)) as MessageKind[]) : undefined;
-  if (!query && !kinds?.length) throw new BridgeError("invalid_params", "query or kinds required");
+  const senderId = typeof p.senderId === "string" && p.senderId ? p.senderId : undefined;
+  if (!query && !kinds?.length && !senderId) throw new BridgeError("invalid_params", "query, kinds or senderId required");
   const limit = Math.min(Math.max(Math.floor(Number(p.limit)) || 50, 1), 200);
   const before = Number(p.before) > 0 ? Number(p.before) : undefined;
   const chatId = typeof p.chatId === "string" && p.chatId ? p.chatId : undefined;
-  return { query, chatId, kinds: kinds?.length ? kinds : undefined, before, limit };
+  return { query, chatId, senderId, kinds: kinds?.length ? kinds : undefined, before, limit };
 }
 
 /** What people type when searching Vietnamese: lowercase, no accents, đ as d. */
@@ -52,6 +55,7 @@ interface Summary {
   hay: string;
   kind: string;
   text?: string;
+  sender?: string;
   deleted: boolean;
   timestamp: number;
   hidden?: boolean;
@@ -59,14 +63,20 @@ interface Summary {
 
 function summarize(m: Message | undefined): Summary {
   if (!m) return { hay: "", kind: "", deleted: true, timestamp: 0, hidden: true };
-  return { hay: haystack(m), kind: m.kind, text: m.text, deleted: !!m.deleted, timestamp: m.timestamp };
+  return { hay: haystack(m), kind: m.kind, text: m.text, sender: m.senderId, deleted: !!m.deleted, timestamp: m.timestamp };
 }
+
+/** Do two user ids name the same person? Bridges whose ids have several spellings (WhatsApp LID / phone jid) pass their own. */
+export type SameSender = (messageSender: string, wanted: string) => boolean;
 
 export class Matcher {
   private readonly words: string[];
   private readonly kinds?: Set<string>;
 
-  constructor(readonly p: SearchParams) {
+  constructor(
+    readonly p: SearchParams,
+    private readonly sameSender: SameSender = (a, b) => a === b,
+  ) {
     this.words = terms(p.query);
     this.kinds = p.kinds ? new Set(p.kinds) : undefined;
   }
@@ -75,6 +85,7 @@ export class Matcher {
     const s: Summary = "hay" in m ? m : summarize(m);
     if (s.hidden || s.deleted || !kindMatches(s as unknown as Message, this.kinds)) return false;
     if (this.p.before !== undefined && s.timestamp >= this.p.before) return false;
+    if (this.p.senderId !== undefined && !(s.sender && this.sameSender(s.sender, this.p.senderId))) return false;
     return this.words.every((w) => s.hay.includes(w));
   }
 }
@@ -93,8 +104,9 @@ export function searchLocal<T extends object>(
   p: SearchParams,
   toMessage: (entry: T, chatId: string) => Message | undefined,
   stamp: (entry: T) => unknown[],
+  sameSender?: SameSender,
 ): Message[] {
-  const matcher = new Matcher(p);
+  const matcher = new Matcher(p, sameSender);
   const hits: Message[] = [];
   for (const [chatId, list] of chats) {
     if (p.chatId && chatId !== p.chatId) continue;

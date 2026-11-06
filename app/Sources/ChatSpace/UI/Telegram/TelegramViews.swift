@@ -347,8 +347,9 @@ struct TelegramConversation: View {
                         if row.showDayHeader {
                             TelegramServicePill(text: TG.dayTitle(row.message.date)).padding(.vertical, 8)
                         }
+                        if let n = row.unreadDivider { UnreadDivider(platform: .telegram, count: n) }
                         TelegramMessageRow(session: session, chat: chat, row: row)
-                            .revealHighlight(session, chatId: chat.id, id: row.id)
+                            .revealHighlight(session, chatId: chat.id, row: row)
                             .padding(.top, row.isFirstInGroup ? 6 : 2)
                     }
                 }
@@ -442,19 +443,24 @@ struct TelegramMessageRow: View {
                 if !m.fromMe && chat.kind == .group {
                     if row.isLastInGroup {
                         TelegramAvatar(id: m.senderId, title: m.senderName ?? "?", source: m.senderAvatar, size: 34)
+                            .memberProfile(session: session, chat: chat, message: m)
                     } else {
                         Color.clear.frame(width: 34, height: 1)
                     }
                 }
-                if m.fromMe { replyButton(m); translateButton(m); reactButton(m) }
                 VStack(alignment: m.fromMe ? .trailing : .leading, spacing: 4) {
                     TelegramBubble(session: session, chat: chat, row: row)
                         .messageContextMenu(session: session, message: m, reactions: ReactionSets.telegram)
+                        .besideBubble(fromMe: m.fromMe) {
+                            HStack(spacing: 6) {
+                                if m.fromMe { replyButton(m); translateButton(m); reactButton(m) }
+                                else { reactButton(m); translateButton(m); replyButton(m) }
+                            }
+                        }
                     if let rows = m.buttons, !rows.isEmpty, !m.isDeleted {
                         TelegramInlineKeyboard(session: session, message: m, rows: rows)
                     }
                 }
-                if !m.fromMe { reactButton(m); translateButton(m); replyButton(m) }
                 if !m.fromMe { Spacer(minLength: ChatMetrics.gap(80, compact)) }
             }
             .padding(.horizontal, compact ? 10 : 14)
@@ -462,7 +468,7 @@ struct TelegramMessageRow: View {
         }
     }
 
-    /// Telegram Desktop's reaction button beside a hovered bubble; the slot is kept so bubbles don't shift.
+    /// Telegram Desktop's reaction button beside a hovered bubble, floating in the margin.
     private func reactButton(_ m: Message) -> some View {
         let show = (hovered || picking) && !m.isDeleted && session.can("reactions")
         return Button { picking = true } label: {
@@ -512,7 +518,8 @@ struct TelegramBubble: View {
     private var metaColor: Color { m.fromMe ? TG.outMeta : TG.inMeta }
 
     var body: some View {
-        let mediaOnly = (m.kind == .image || m.kind == .video || m.kind == .gif) && (m.text ?? "").isEmpty
+        let mediaOnly = row.album != nil ? row.albumCaption == nil && row.albumOthers.isEmpty
+            : (m.kind == .image || m.kind == .video || m.kind == .gif) && (m.text ?? "").isEmpty
         let isSticker = m.kind == .sticker || (m.kind == .text && isJumboEmoji(m.text))
 
         if isSticker {
@@ -527,6 +534,7 @@ struct TelegramBubble: View {
             BubbleColumn(spacing: 4) {
                 if !m.fromMe && chat.kind == .group && row.isFirstInGroup && !mediaOnly {
                     Text(m.senderName ?? "").font(.system(size: 13, weight: .semibold)).foregroundStyle(TG.nameColor(m.senderId))
+                        .memberProfile(session: session, chat: chat, message: m)
                 }
                 if m.forwarded == true {
                     Text("Forwarded message").font(.system(size: 13)).foregroundStyle(m.fromMe ? TG.outMeta : TG.accent)
@@ -568,6 +576,24 @@ struct TelegramBubble: View {
     private func content(mediaOnly: Bool) -> some View {
         if m.isDeleted {
             Text("Message deleted").italic().font(.system(size: 14)).foregroundStyle(TG.secondary)
+        } else if row.album != nil {
+            VStack(alignment: .leading, spacing: 4) {
+                if !row.albumMedia.isEmpty {
+                    AlbumGrid(session: session, items: row.albumMedia, width: 360, cornerRadius: mediaOnly ? 0 : 10)
+                        .overlay(alignment: .bottomTrailing) {
+                            if mediaOnly {
+                                meta.environment(\.colorScheme, .dark).padding(.horizontal, 6).padding(.vertical, 2)
+                                    .background(Capsule().fill(.black.opacity(0.4))).padding(6)
+                            }
+                        }
+                }
+                ForEach(row.albumOthers) { f in
+                    FileContent(session: session, message: f, iconColor: m.fromMe ? TG.outMeta : TG.accent, subtitleColor: metaColor)
+                }
+                if !mediaOnly {
+                    if row.albumCaption != nil { textWithMeta } else { HStack { Spacer(); meta } }
+                }
+            }
         } else {
             switch m.kind {
             case .image, .video, .gif:
@@ -588,6 +614,11 @@ struct TelegramBubble: View {
                     if let t = m.text, !t.isEmpty, m.kind == .file, m.media?.fileName != nil, t != m.media?.fileName { textWithMeta }
                     else { HStack { Spacer(); meta } }
                 }
+            case .call:
+                HStack(alignment: .bottom, spacing: 12) {
+                    CallContent(message: m, titleColor: .black, subtitleColor: metaColor)
+                    meta
+                }
             default:
                 textWithMeta
             }
@@ -597,12 +628,10 @@ struct TelegramBubble: View {
     /// Text with the time/checks tucked into the last line, as Telegram does.
     private var textWithMeta: some View {
         let link = m.fromMe ? Color(hex: 0x3A8E26) : TG.accent
-        let reserve = Text("  " + (m.isEdited ? "edited " : "") + Fmt.time(m.date) + (m.fromMe ? "  ✓✓" : ""))
-            .font(.system(size: 11.5)).foregroundColor(.clear)
+        let reserve = "  " + (m.isEdited ? "edited " : "") + Fmt.time(m.date) + (m.fromMe ? "  ✓✓" : "")
         return ZStack(alignment: .bottomTrailing) {
-            (Text(linkified(m.text ?? "", linkColor: link)) + reserve)
-                .font(.system(size: 14.5)).foregroundStyle(.black).textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
+            BodyText(text: m.text ?? "", links: m.links, font: .system(size: 14.5), nsFont: .systemFont(ofSize: 14.5),
+                     color: .black, linkColor: link, reserve: reserve, reserveSize: 11.5)
             meta.offset(y: 2)
         }
     }

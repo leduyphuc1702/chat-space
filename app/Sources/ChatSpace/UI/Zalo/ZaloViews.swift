@@ -523,8 +523,9 @@ struct ZaloConversation: View {
                                 .background(Capsule().fill(Color(hex: 0x8A99AD).opacity(0.75)))
                                 .frame(maxWidth: .infinity).padding(.vertical, 12)
                         }
+                        if let n = row.unreadDivider { UnreadDivider(platform: .zalo, count: n) }
                         ZaloMessageRow(session: session, chat: chat, row: row, showStatus: row.id == lastOut)
-                            .revealHighlight(session, chatId: chat.id, id: row.id)
+                            .revealHighlight(session, chatId: chat.id, row: row)
                             .padding(.top, row.isFirstInGroup && !row.showTimeGap ? 10 : 3)
                     }
                 }
@@ -605,15 +606,17 @@ struct ZaloMessageRow: View {
                     if !m.fromMe {
                         if row.isFirstInGroup {
                             ZaloAvatar(id: m.senderId, title: m.senderName ?? chat.title, source: m.senderAvatar ?? (chat.isGroup ? nil : chat.avatar), size: compact ? 32 : 40)
+                                .memberProfile(session: session, chat: chat, message: m)
                         } else {
                             Color.clear.frame(width: compact ? 32 : 40, height: 1)
                         }
                     }
-                    if m.fromMe && active { hoverActions }
                     ZaloBubble(session: session, chat: chat, row: row, hovered: active, picking: $picking,
                                reserveBadge: showStatus && m.fromMe && m.status != nil)
                         .messageContextMenu(session: session, message: m, labels: .vietnamese, reactions: ReactionSets.zalo)
-                    if !m.fromMe && active { hoverActions }
+                        .besideBubble(fromMe: m.fromMe, spacing: 8, vertical: .top) {
+                            if active { hoverActions }
+                        }
                     if !m.fromMe { Spacer(minLength: ChatMetrics.gap(120, compact)) }
                 }
                 if showStatus, m.fromMe, let s = m.status {
@@ -643,7 +646,7 @@ struct ZaloMessageRow: View {
                 .frame(width: 26, height: 26).background(Circle().fill(.white)).contentShape(Circle())
         }
         .buttonStyle(.plain).foregroundStyle(ZL.secondary).help("Trả lời")
-        .padding(.top, 6)
+        .padding(.top, 8)
     }
 }
 
@@ -660,11 +663,14 @@ struct ZaloBubble: View {
     private var m: Message { row.message }
 
     var body: some View {
-        let mediaOnly = (m.kind == .image || m.kind == .video || m.kind == .gif) && (m.text ?? "").isEmpty
-        let isSticker = m.kind == .sticker || (m.kind == .text && isJumboEmoji(m.text))
+        let mediaOnly = row.album != nil ? row.albumCaption == nil && row.albumOthers.isEmpty
+            : (m.kind == .image || m.kind == .video || m.kind == .gif) && (m.text ?? "").isEmpty
+        let isSticker = row.album == nil && (m.kind == .sticker || (m.kind == .text && isJumboEmoji(m.text)))
 
         Group {
-            if isSticker && !m.isDeleted {
+            if row.album != nil && mediaOnly && !m.isDeleted {
+                AlbumGrid(session: session, items: row.albumMedia, width: 340, spacing: 3, cornerRadius: 8)
+            } else if isSticker && !m.isDeleted {
                 if m.kind == .sticker { MediaContent(session: session, message: m, maxWidth: 130) }
                 else { Text(m.text ?? "").font(.zalo(44)) }
             } else if mediaOnly && !m.isDeleted {
@@ -673,6 +679,7 @@ struct ZaloBubble: View {
                 BubbleColumn(spacing: 4) {
                     if !m.fromMe && chat.isGroup && row.isFirstInGroup {
                         Text(m.senderName ?? "").font(.zalo(12.5)).foregroundStyle(ZL.secondary)
+                            .memberProfile(session: session, chat: chat, message: m)
                     }
                     if let r = m.replyTo, !m.isDeleted { reply(r).bubbleFill() }
                     content
@@ -712,6 +719,12 @@ struct ZaloBubble: View {
     private var content: some View {
         if m.isDeleted {
             Text("Tin nhắn đã được thu hồi").font(.zalo(15)).foregroundStyle(ZL.secondary)
+        } else if row.album != nil {
+            if !row.albumMedia.isEmpty { AlbumGrid(session: session, items: row.albumMedia, width: 320, spacing: 3, cornerRadius: 6) }
+            ForEach(row.albumOthers) { f in
+                FileContent(session: session, message: f, iconColor: ZL.blue, titleColor: ZL.text, subtitleColor: ZL.secondary)
+            }
+            if let t = row.albumCaption { textBody(t) }
         } else {
             switch m.kind {
             case .image, .video, .gif:
@@ -719,6 +732,8 @@ struct ZaloBubble: View {
                 if let t = m.text, !t.isEmpty { textBody(t) }
             case .file, .audio, .voice:
                 FileContent(session: session, message: m, iconColor: ZL.blue, titleColor: ZL.text, subtitleColor: ZL.secondary)
+            case .call:
+                CallContent(message: m, titleColor: ZL.text, subtitleColor: ZL.secondary, font: { .zalo($0, $1) })
             case .link:
                 VStack(alignment: .leading, spacing: 6) {
                     if let thumb = m.media?.thumbnail ?? m.media?.url {
@@ -733,9 +748,7 @@ struct ZaloBubble: View {
     }
 
     private func textBody(_ t: String) -> some View {
-        Text(linkified(t, linkColor: ZL.blue))
-            .font(.zalo(15)).foregroundStyle(ZL.text).textSelection(.enabled)
-            .fixedSize(horizontal: false, vertical: true)
+        BodyText(text: t, links: m.links, font: .zalo(15), nsFont: .zalo(15), color: ZL.text, linkColor: ZL.blue)
     }
 
     private func reply(_ r: ReplyRef) -> some View {

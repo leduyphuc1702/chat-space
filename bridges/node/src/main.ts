@@ -35,8 +35,12 @@ function safeJson(v: unknown) {
   }
 }
 
+// A string cut mid-emoji keeps a lone surrogate; JSON.stringify writes it as a `\ud83d` escape, which the
+// app's decoder rejects together with the whole frame.
+const wellFormed = (_key: string, v: unknown) => (typeof v === "string" ? v.toWellFormed() : v);
+
 function write(frame: unknown) {
-  process.stdout.write(JSON.stringify(frame) + "\n");
+  process.stdout.write(JSON.stringify(frame, wellFormed) + "\n");
 }
 
 const ctx: AdapterContext = {
@@ -90,6 +94,7 @@ const handlers: Record<string, (p: Params) => Promise<unknown>> = {
   "chats.list": async (p) => ({ chats: await adapter.listChats(p.limit ?? 100) }),
   "chats.avatar": async (p) => ({ avatar: await adapter.chatAvatar(need(p, "chatId")) }),
   "chats.members": async (p) => ({ members: await adapter.chatMembers(need(p, "chatId")) }),
+  "chats.direct": async (p) => ({ chat: await adapter.directChat(need(p, "userId")) }),
   "messages.list": async (p) => ({
     messages: await adapter.listMessages(need(p, "chatId"), p.limit ?? 50, p.before),
   }),

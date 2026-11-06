@@ -52,3 +52,41 @@ test("searchLocal returns newest first across chats, capped, and notices in-plac
   b[1]!.text = "lunch after all";
   expect(run("lunch", 50, "B")).toEqual(["b2", "b1"]);
 });
+
+test("senderId alone is a valid search; kinds, query and chat narrow it further", () => {
+  expect(parseSearch({ senderId: "u1" })).toMatchObject({ query: "", senderId: "u1", kinds: undefined });
+  expect(() => parseSearch({ senderId: "" })).toThrow();
+  const mine = msg("1", "c", 10, "hello", { senderId: "u1" });
+  const other = msg("2", "c", 11, "hello", { senderId: "u2" });
+  const photo = msg("3", "c", 12, undefined, { senderId: "u1", kind: "image" });
+  const sys = msg("4", "c", 13, "u1 joined", { senderId: "u1", kind: "system" });
+  expect(new Matcher(parseSearch({ senderId: "u1" })).test(mine)).toBe(true);
+  expect(new Matcher(parseSearch({ senderId: "u1" })).test(other)).toBe(false);
+  expect(new Matcher(parseSearch({ senderId: "u1" })).test(sys)).toBe(false); // system lines are left out as usual
+  expect(new Matcher(parseSearch({ senderId: "u1", kinds: ["image"] })).test(photo)).toBe(true);
+  expect(new Matcher(parseSearch({ senderId: "u1", kinds: ["image"] })).test(mine)).toBe(false);
+  expect(new Matcher(parseSearch({ senderId: "u1", query: "hello" })).test(mine)).toBe(true);
+  expect(new Matcher(parseSearch({ senderId: "u2", query: "hello" })).test(mine)).toBe(false);
+  expect(new Matcher(parseSearch({ query: "hello" })).test(other)).toBe(true); // no senderId: everybody
+});
+
+test("searchLocal with senderId + kinds + chatId and a custom same-person check", () => {
+  const a = [msg("a1", "A", 1, undefined, { senderId: "pn", kind: "image" }), msg("a2", "A", 2, undefined, { senderId: "lid", kind: "image" }), msg("a3", "A", 3, undefined, { senderId: "x", kind: "image" })];
+  const b = [msg("b1", "B", 4, undefined, { senderId: "pn", kind: "image" })];
+  const run = (p: Record<string, any>, same?: (a: string, b: string) => boolean) =>
+    searchLocal(
+      [
+        ["A", a],
+        ["B", b],
+      ],
+      parseSearch(p),
+      (e) => e,
+      (e) => [e.text],
+      same,
+    ).map((m) => m.id);
+  expect(run({ senderId: "pn", kinds: ["image"] })).toEqual(["b1", "a1"]);
+  expect(run({ senderId: "pn", kinds: ["image"], chatId: "A" })).toEqual(["a1"]);
+  const samePerson = (m: string, wanted: string) => m === wanted || (m === "lid" && wanted === "pn");
+  expect(run({ senderId: "pn", kinds: ["image"], chatId: "A" }, samePerson)).toEqual(["a2", "a1"]);
+  expect(run({ senderId: "pn", kinds: ["image"], before: 4 }, samePerson)).toEqual(["a2", "a1"]);
+});

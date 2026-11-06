@@ -590,6 +590,9 @@ type attachment struct {
 	kind  string
 	media Media
 	text  string // extra text carried by the attachment (link shares, locations)
+	// link is the address a link card opens. It is not written into text: the message shows
+	// the card's title and Message.links makes the title open the address (see addAttachmentText).
+	link string
 }
 
 func kindFromAttachment(at table.AttachmentType, mime, fileName string) string {
@@ -667,6 +670,8 @@ func (b *bridge) convertWrapped(w *table.WrappedMessage, chat string) []*storedM
 	if c, ok := b.st.contact(sender); ok {
 		base.SenderName, base.SenderAvatar = c.Name, c.Avatar
 	}
+	base.Text = resolveOpenMentions(w.Text, w.MentionIds, w.MentionOffsets, w.MentionLengths,
+		func(user string) string { return b.mentionName(chat, user) })
 	if fromMe {
 		base.SenderName = selfName
 		base.Status = "sent"
@@ -727,7 +732,7 @@ func (b *bridge) convertWrapped(w *table.WrappedMessage, chat string) []*storedM
 			m := first.media
 			base.Media = &m
 		}
-		base.Text = joinText(base.Text, first.text)
+		addAttachmentText(&base.Message, first)
 	case w.IsAdminMessage:
 		base.Kind = "system"
 	case base.Text == "":
@@ -735,7 +740,7 @@ func (b *bridge) convertWrapped(w *table.WrappedMessage, chat string) []*storedM
 			base.Kind = "sticker"
 		} else {
 			base.Kind = "unsupported"
-			base.Text = "Unsupported message"
+			base.Text = unsupportedE2EEText
 		}
 	}
 
@@ -744,25 +749,56 @@ func (b *bridge) convertWrapped(w *table.WrappedMessage, chat string) []*storedM
 		a := atts[i]
 		extra := &storedMsg{
 			Message: Message{
-				ID:         fmt.Sprintf("%s:%d", w.MessageId, i),
-				ChatID:     chat,
-				SenderID:   sender,
-				SenderName: base.SenderName,
-				FromMe:     fromMe,
-				Timestamp:  w.TimestampMs,
-				Kind:       a.kind,
-				Text:       a.text,
-				Status:     base.Status,
+				ID:           fmt.Sprintf("%s:%d", w.MessageId, i),
+				ChatID:       chat,
+				SenderID:     sender,
+				SenderName:   base.SenderName,
+				SenderAvatar: base.SenderAvatar,
+				FromMe:       fromMe,
+				// One millisecond apart so the parts keep their order and stay together.
+				Timestamp: w.TimestampMs + int64(i),
+				Kind:      a.kind,
+				Status:    base.Status,
 			},
 			Sort: w.PrimarySortKey,
 		}
+		addAttachmentText(&extra.Message, a)
 		if a.media != (Media{}) {
 			m := a.media
 			extra.Media = &m
 		}
 		out = append(out, extra)
 	}
+	if len(out) > 1 {
+		// What Messenger sent as one message (several photos, a photo and its caption) is
+		// shown as one album: every part carries the id of the message.
+		for _, m := range out {
+			m.GroupID = w.MessageId
+		}
+	}
 	return out
+}
+
+// addAttachmentText adds what an attachment says to the text of the message part that shows
+// it. A link card contributes its title, which then opens the card's address through
+// Message.links; the address is only written out when there is no title or when the text
+// already shows it.
+func addAttachmentText(m *Message, a attachment) {
+	if a.link == "" {
+		m.Text = joinText(m.Text, a.text)
+		return
+	}
+	switch {
+	case strings.Contains(strings.ToLower(m.Text), normURL(a.link)):
+		m.Text = joinText(m.Text, a.text) // the address is already in the text
+	case a.text == "":
+		m.Text = joinText(m.Text, a.link)
+	default:
+		m.Text = joinText(m.Text, a.text)
+		if off := utf16Offset(m.Text, a.text); off >= 0 {
+			m.Links = append(m.Links, Link{Offset: off, Length: utf16Len(a.text), URL: a.link})
+		}
+	}
 }
 
 func joinText(a, b string) string {
@@ -805,14 +841,20 @@ func legacyAttachment(a *table.LSInsertAttachment) attachment {
 	}
 	if a.ActionUrl != "" && url == "" {
 		at.kind = "link"
-		at.text = joinText(a.TitleText, removeLPHP(a.ActionUrl))
+		at.text, at.link = a.TitleText, removeLPHP(a.ActionUrl)
 	}
 	return at
 }
 
 func xmaAttachment(x *table.WrappedXMA) attachment {
 	if x.CTA != nil && (x.CTA.Type_ == "xma_live_location_sharing" || strings.HasPrefix(x.CTA.NativeUrl, "messenger://location_share")) {
-		return attachment{kind: "location", text: strings.TrimSpace(x.TitleText + "\n" + x.SubtitleText)}
+		at := attachment{kind: "location", text: firstNonEmpty(strings.TrimSpace(x.TitleText+"\n"+x.SubtitleText), "Location")}
+		if lat, lon, ok := locationFromNativeURL(x.CTA.NativeUrl); ok {
+			if l := mapLinks(at.text, lat, lon); len(l) > 0 {
+				at.link = l[0].URL
+			}
+		}
+		return at
 	}
 	url, mime := x.PlayableUrl, x.PlayableUrlMimeType
 	w, h := int64(0), int64(0)
@@ -828,7 +870,7 @@ func xmaAttachment(x *table.WrappedXMA) attachment {
 	switch {
 	case link != "":
 		at.kind = "link"
-		at.text = joinText(x.TitleText, link)
+		at.text, at.link = x.TitleText, link
 	case url != "":
 		at.kind = kindFromAttachment(x.AttachmentType, mime, x.Filename)
 		if x.ShouldAutoplayVideo {
@@ -840,7 +882,7 @@ func xmaAttachment(x *table.WrappedXMA) attachment {
 		at.text = x.TitleText
 	default:
 		at.kind = "unsupported"
-		at.text = "Unsupported message"
+		at.text = unsupportedE2EEText
 	}
 	return at
 }
@@ -1082,13 +1124,16 @@ func (b *bridge) chatView(t threadRec) Chat {
 		c.Muted, c.MutedUntil = true, t.MuteUntil
 	}
 	if kind == "direct" || kind == "self" || kind == "bot" {
-		if co, ok := b.st.contact(peerID(t)); ok {
-			c.Title = firstNonEmpty(co.Name, c.Title)
-			c.Avatar = firstNonEmpty(co.Avatar, c.Avatar)
-		}
+		co, _ := b.st.contact(peerID(t))
+		c.Title = firstNonEmpty(co.Name, c.Title)
+		// The same key as the sender avatar of that person's messages, so one download
+		// serves both; a fresher signed URL on either side wins over an expired one.
+		c.Avatar = b.st.avatarFor(peerID(t), co.Avatar, t.Avatar)
 		if kind == "self" {
 			c.Title = firstNonEmpty(selfName, c.Title)
 		}
+	} else {
+		c.Avatar = b.st.avatarFor("chat-"+t.ID, t.Avatar)
 	}
 	if c.Title == "" {
 		c.Title = t.ID

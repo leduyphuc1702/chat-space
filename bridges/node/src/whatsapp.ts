@@ -16,10 +16,12 @@ import {
   isJidNewsletter,
   isLidUser,
   isPnUser,
+  isRealMessage,
   jidDecode,
   makeWASocket,
   proto,
   S_WHATSAPP_NET,
+  shouldIncrementChatUnread,
   useMultiFileAuthState,
   type AnyMessageContent,
   type BaileysEventMap,
@@ -49,13 +51,13 @@ import {
   type Message,
   type StorageConfig,
 } from "./types.ts";
-import { fallbackName, isStorable, mapMessage, mediaContent, pinEvent, statusOf, type MapCtx } from "./whatsapp-map.ts";
-import {
+import { fallbackName, isStorable, mapMessage, mediaContent, pinEvent, statusOf, type MapCtx } from "./whatsapp-map.ts";import {
   MAX_MESSAGES_PER_CHAT,
   WAStore,
   applyReaction,
   applyReceipt,
   editedContent,
+  keepContextInfo,
   muteArg,
   muteEndMs,
   normJid,
@@ -86,7 +88,7 @@ const safeName = (s: string) => s.replace(/[^A-Za-z0-9._-]/g, "_");
 export class WhatsAppAdapter extends Adapter {
   readonly platform = "whatsapp";
   // "edit" is deliberately absent: the protocol has no edit method yet (edits are received and shown).
-  readonly capabilities = ["reactions", "reply", "delete", "edit", "typing", "read_receipts", "media_send", "voice", "presence", "mentions", "forward", "search", "mute", "pins"];
+  readonly capabilities = ["reactions", "reply", "delete", "edit", "typing", "read_receipts", "media_send", "voice", "presence", "mentions", "forward", "search", "mute", "pins", "direct_chat"];
 
   private store: WAStore;
   private readonly authDir: string;
@@ -191,6 +193,7 @@ export class WhatsAppAdapter extends Adapter {
       canon: (j) => a.store.canon(j),
       nameOf: (j) => a.store.contactName(j),
       groupSize: (c) => a.groupSize(c),
+      aliases: (j) => a.store.aliasesOf(j),
     };
   }
 
@@ -482,7 +485,12 @@ export class WhatsAppAdapter extends Adapter {
     if (ev["contacts.upsert"]) await step("contacts.upsert", () => this.onContacts(ev["contacts.upsert"]!));
     if (ev["contacts.update"]) await step("contacts.update", () => this.onContacts(ev["contacts.update"]!));
     if (ev["chats.upsert"]) await step("chats.upsert", () => this.onChats(ev["chats.upsert"]!, "absolute"));
-    if (ev["chats.update"]) await step("chats.update", () => this.onChats(ev["chats.update"]! as any[], "delta"));
+    if (ev["chats.update"]) {
+      // Baileys adds one unread per incoming message that is "real" to it, the hidden ones (album parents, HD copies,
+      // encrypted add-ons) included; the same batch tells which those are.
+      const hidden = ev["messages.upsert"] ? this.hiddenIncoming(ev["messages.upsert"]!.messages) : undefined;
+      await step("chats.update", () => this.onChats(ev["chats.update"]! as any[], "delta", hidden));
+    }
     if (ev["chats.delete"]) {
       await step("chats.delete", () => {
         for (const id of ev["chats.delete"]!) this.store.deleteChat(this.store.canon(id));
@@ -836,7 +844,7 @@ export class WhatsAppAdapter extends Adapter {
       if (id) touched.add(id);
     }
     let n = 0;
-    for (const m of h.messages ?? []) {
+    for (const m of oldestFirst(h.messages ?? [])) {
       const r = await this.ingest(m);
       if (r) {
         touched.add(r.chatId);
@@ -877,11 +885,22 @@ export class WhatsAppAdapter extends Adapter {
     }
   }
 
-  private async onChats(list: any[], mode: "absolute" | "delta") {
+  private async onChats(list: any[], mode: "absolute" | "delta", hidden?: Map<string, number>) {
     for (const c of list) {
-      const id = this.applyChat(c, mode, true);
+      const id = this.applyChat(c, mode, true, hidden?.get(this.store.canon(c?.id)) ?? 0);
       if (id) this.queueChatUpsert(id);
     }
+  }
+
+  /** Per chat: incoming messages Baileys counted as unread that never show as a bubble. */
+  private hiddenIncoming(messages: WAMessage[]): Map<string, number> {
+    const out = new Map<string, number>();
+    for (const m of messages) {
+      if (!m.key?.remoteJid || !isRealMessage(m) || !shouldIncrementChatUnread(m) || isStorable(m)) continue;
+      const cid = this.store.canon(m.key.remoteJid);
+      out.set(cid, (out.get(cid) ?? 0) + 1);
+    }
+    return out;
   }
 
   /**
@@ -889,7 +908,7 @@ export class WhatsAppAdapter extends Adapter {
    * `absolute`: unreadCount is the new total. `delta`: unreadCount > 0 means "+n" (Baileys' convention
    * in chats.update), 0/null means read, < 0 means marked unread.
    */
-  private applyChat(c: any, mode: "absolute" | "delta", trustUnread: boolean): string | undefined {
+  private applyChat(c: any, mode: "absolute" | "delta", trustUnread: boolean, notShown = 0): string | undefined {
     const id: string | undefined = c?.id;
     if (!id || this.skipJid(id)) return undefined;
     if (c.pnJid && isLidUser(normJid(id))) this.store.link(id, c.pnJid);
@@ -937,7 +956,7 @@ export class WhatsAppAdapter extends Adapter {
         marked = false;
       } else if (typeof v === "number") {
         if (v < 0) marked = true; // "mark as unread" from the phone: keep the count, add the flag
-        else unread += v; // delta: Baileys sends +1 per real incoming message
+        else unread += Math.max(0, v - notShown); // delta: Baileys sends +1 per real incoming message
       }
       if (unread !== sc.unread || marked !== !!sc.markedUnread) {
         sc.unread = unread;
@@ -988,8 +1007,9 @@ export class WhatsAppAdapter extends Adapter {
         sm.edited = true;
         changed = true;
       } else if (u.message) {
-        // e.g. refreshed media URL after a re-upload request
-        sm.raw.message = plainContent(u.message);
+        // e.g. refreshed media URL after a re-upload request. The update carries the media only: the album
+        // association (and the other messageContextInfo) of the stored message must survive it.
+        sm.raw.message = keepContextInfo(sm.raw.message, plainContent(u.message));
         changed = true;
       }
       if (u.status != null && sm.raw.key?.fromMe) {
@@ -1299,6 +1319,33 @@ export class WhatsAppAdapter extends Adapter {
     });
   }
 
+  /**
+   * chats.direct (capability direct_chat): the one-to-one chat with a group member, from a group Message.senderId (a
+   * phone jid or a LID, with or without device). Nothing is sent and nothing goes over the network: the person is
+   * looked up through the LID<->PN map we hold (and Baileys' local mapping store). The answer is, in this order,
+   *   1. the stored chat with that person under any spelling of their jid (the canonical one first),
+   *   2. else a new chat on their phone jid, when the map knows it,
+   *   3. else a new chat on the LID.
+   * A new chat is only described, not stored: like on the phone, it exists once a message is in it (the first send
+   * creates it and announces it with chat.upsert). Its id is the canonical jid, which messages.send / messages.list
+   * canonicalise to the same value.
+   */
+  async directChat(userId: string): Promise<Chat> {
+    this.requireData();
+    const given = typeof userId === "string" ? userId.trim() : "";
+    const n = normJid(/^\d{5,}$/.test(given) ? `${given}@s.whatsapp.net` : given);
+    if (!n || !(isPnUser(n) || isLidUser(n))) throw new BridgeError("invalid_params", "userId is not a person");
+    await this.resolveLid(n); // Baileys' own mapping store: memory and local keys only
+    const cid = this.store.canon(n);
+    const forms = [...new Set([cid, n, ...this.store.aliasesOf(cid), ...this.store.aliasesOf(n)])];
+    const stored = forms.map((f) => this.store.getChat(f)).find((c): c is StoredChat => !!c);
+    const name = forms.map((f) => this.store.contactName(f)).find(Boolean);
+    const chat = this.buildChat(stored ?? { id: cid, name, unread: 0, timestamp: Date.now() });
+    // A picture that is already cached under another spelling of the same person.
+    chat.avatar ??= forms.map((f) => this.avatarFile(this.store.canon(f))).find((f) => existsSync(f));
+    return chat;
+  }
+
   async chatAvatar(chatId: string): Promise<string | undefined> {
     const cid = this.store.canon(chatId);
     if (!cid || this.skipJid(cid)) return undefined;
@@ -1389,7 +1436,30 @@ export class WhatsAppAdapter extends Adapter {
       { ...p, chatId: undefined },
       (sm, cid) => mapMessage(sm, cid, this.mc) ?? undefined,
       (sm) => [sm.raw, sm.deleted, sm.edited],
+      p.senderId ? this.sameSender(p.senderId) : undefined,
     );
+  }
+
+  /**
+   * Is a message's sender the wanted person? The app may ask with the LID or the phone jid (chats.members hands out
+   * whichever WhatsApp uses for the group) while a message names its sender in the canonical form, so both sides are
+   * compared through every spelling we know. A bare number counts as a phone number or a LID.
+   */
+  private sameSender(wanted: string): (messageSender: string) => boolean {
+    const forms = (j: string): string[] => {
+      const spellings = j.includes("@") ? [j] : [`${j}@s.whatsapp.net`, `${j}@lid`];
+      return spellings.flatMap((s) => [normJid(s), this.store.canon(s), ...this.store.aliasesOf(this.store.canon(s)), ...this.store.aliasesOf(s)]).filter(Boolean);
+    };
+    const want = new Set(forms(wanted));
+    const seen = new Map<string, boolean>();
+    return (sender) => {
+      let hit = seen.get(sender);
+      if (hit === undefined) {
+        hit = want.has(sender) || forms(sender).some((f) => want.has(f));
+        seen.set(sender, hit);
+      }
+      return hit;
+    };
   }
 
   /**
@@ -1459,7 +1529,7 @@ export class WhatsAppAdapter extends Adapter {
     // "@Name" the app typed is replaced by "@<jid user>" (and that is also the text we echo back).
     let text = params.text ?? "";
     let mentions: string[] | undefined;
-    const spans = sanitizeMentions(text, params.mentions);
+    const spans = this.nativeMentions(cid, sanitizeMentions(text, params.mentions));
     if (spans.length) {
       const r = rewriteWhatsAppMentions(text, spans);
       text = r.text;
@@ -1469,6 +1539,22 @@ export class WhatsAppAdapter extends Adapter {
     const content = (mentions ? { ...base, mentions } : base) as AnyMessageContent;
 
     return this.deliver(cid, content, { quoted });
+  }
+
+  /**
+   * A mention has to name the person the way the group does: its participants are phone jids in some groups and LIDs
+   * in others (chats.members hands out exactly those), and the visible `@<number>` is the user part of that jid. If the
+   * app sends the other spelling of a participant (a Message.senderId is canonical, i.e. the phone jid), switch to the
+   * group's own. Without cached group metadata the id is used as given.
+   */
+  private nativeMentions(cid: string, spans: MentionSpan[]): MentionSpan[] {
+    const people = this.groupMeta.get(cid)?.participants;
+    if (!spans.length || !people?.length) return spans;
+    return spans.map((s) => {
+      const want = this.store.canon(s.userId);
+      const p = people.find((q) => [q.id, q.phoneNumber, q.lid].some((j) => j && this.store.canon(j) === want));
+      return p?.id && p.id !== s.userId ? { ...s, userId: p.id } : s;
+    });
   }
 
   /**
@@ -1689,7 +1775,7 @@ export class WhatsAppAdapter extends Adapter {
     if (sm.deleted) throw new BridgeError("invalid_params", "A deleted message cannot be edited");
     let body = text;
     let mentionedJid: string[] | undefined;
-    const spans = sanitizeMentions(text, mentions);
+    const spans = this.nativeMentions(cid, sanitizeMentions(text, mentions));
     if (spans.length) {
       const r = rewriteWhatsAppMentions(text, spans);
       body = r.text;
@@ -1850,6 +1936,28 @@ export class WhatsAppAdapter extends Adapter {
       this.ctx.log("whatsapp: sendTyping failed", String(e?.message ?? e));
     }
   }
+}
+
+/**
+ * A history chunk lists each chat's messages newest first. The store sorts by second-precision timestamps and keeps
+ * insertion order for ties, so the photos of an album (sent within the same second) would come out reversed:
+ * hand them over oldest first, chat by chat (the chats keep their order).
+ */
+export function oldestFirst<T extends { key?: { remoteJid?: string | null } | null; messageTimestamp?: unknown }>(messages: T[]): T[] {
+  const byChat = new Map<string, T[]>();
+  for (const m of messages) {
+    const k = m.key?.remoteJid ?? "";
+    const list = byChat.get(k);
+    if (list) list.push(m);
+    else byChat.set(k, [m]);
+  }
+  const out: T[] = [];
+  for (const list of byChat.values()) {
+    const descending = list.length > 1 && num(list[0]!.messageTimestamp) > num(list[list.length - 1]!.messageTimestamp);
+    if (descending) list.reverse();
+    out.push(...list);
+  }
+  return out;
 }
 
 const EXT_BY_MIME: Record<string, string> = {

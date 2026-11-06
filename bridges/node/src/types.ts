@@ -193,6 +193,10 @@ export interface Message {
   hideKeyboard?: boolean;
   /** The bot asks for a reply to this message (ReplyKeyboardForceReply); `placeholder` goes in the composer. */
   forceReply?: { placeholder?: string; oneTime?: boolean };
+  /** Album: messages sent together share it and are drawn as one bubble. */
+  groupId?: string;
+  /** Text links whose URL is not part of `text` (UTF-16 offsets into `text`). */
+  links?: { offset: number; length: number; url: string }[];
 }
 
 /** Result of messages.clickButton. */

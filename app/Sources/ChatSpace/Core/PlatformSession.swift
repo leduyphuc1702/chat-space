@@ -414,7 +414,37 @@ final class PlatformSession {
         trimMessages(except: chatId)
         if messages[chatId] == nil { Task { await loadMessages(chatId) } }
         loadPins(chatId)
+        if let c = chats.first(where: { $0.id == chatId }), c.unread > 0 { openedUnread[chatId] = c.unread }
         markRead(chatId)
+    }
+
+    /// Unread count a chat had when it was opened (it is marked read at once), for the scroll view to land
+    /// on the first unread message. Read once.
+    @ObservationIgnored private var openedUnread: [String: Int] = [:]
+
+    func takeOpenedUnread(_ chatId: String) -> Int {
+        openedUnread.removeValue(forKey: chatId) ?? 0
+    }
+
+    /// The oldest of the `count` newest incoming messages, paging back a little when they aren't all loaded
+    /// (never on Messenger, where each page is a request to Meta: it lands on the oldest loaded one instead).
+    func firstUnread(_ chatId: String, count: Int) async -> String? {
+        func find() -> (id: String?, enough: Bool) {
+            guard let list = messages[chatId] else { return (nil, false) }
+            var seen = 0
+            for m in list.reversed() where !m.fromMe && m.kind != .system {
+                seen += 1
+                if seen == count { return (m.id, true) }
+            }
+            return (list.first { !$0.fromMe && $0.kind != .system }?.id, false)
+        }
+        var pages = 0
+        while case let r = find(), !r.enough, platform != .messenger, pages < 4, !reachedStart.contains(chatId) {
+            while loadingHistory.contains(chatId) { try? await Task.sleep(nanoseconds: 40_000_000) }
+            guard await fetchOlder(chatId, limit: 100) else { break }
+            pages += 1
+        }
+        return find().id
     }
 
     // MARK: Bot buttons
@@ -601,19 +631,54 @@ final class PlatformSession {
         }
     }
 
+    // MARK: Private chat with a member
+
+    /// The one-to-one chat with `userId`, when it is in the chat list.
+    func directChat(with userId: String) -> Chat? {
+        // Zalo prefixes 1:1 chat ids with "u:".
+        let ids: Set<String> = platform == .zalo ? [userId, "u:" + userId] : [userId]
+        return chats.first { ($0.kind == .direct || $0.kind == .bot) && ids.contains($0.id) }
+    }
+
+    /// Opens the private chat with a group member: the existing one, else the one the bridge finds or starts
+    /// (`chats.direct`). False when the platform can't open it from here.
+    func openDirect(userId: String, name: String, avatar: String?) async -> Bool {
+        var chat = directChat(with: userId)
+        if chat == nil, DemoData.enabled {
+            let c = Chat(id: userId, title: name, avatar: avatar, kind: .direct, unread: 0, timestamp: Date().timeIntervalSince1970 * 1000)
+            chats.insert(c, at: 0)
+            messages[userId] = messages[userId] ?? []
+            reachedStart.insert(userId)
+            chat = c
+        }
+        if chat == nil, can("direct_chat"),
+           let r = try? await call("chats.direct", ["userId": .string(userId)]),
+           var c = try? r["chat"]?.decode(Chat.self) {
+            if c.avatar == nil { c.avatar = avatar }
+            upsertChat(c)
+            chat = c
+        }
+        guard let chat else { return false }
+        AppModel.shared.rail = .platform(platform)
+        select(chat.id)
+        return true
+    }
+
     // MARK: Search
 
     /// Messages matching `query` (every word, accent-insensitive), newest first: the bridge searches all it has
     /// (`messages.search`), otherwise only what is loaded here. `before` (ms) asks for the next page.
-    func search(_ query: String, chatId: String? = nil, kinds: [MessageKind]? = nil,
+    /// `senderId` keeps one person's messages (with no query or kinds: all of them).
+    func search(_ query: String, chatId: String? = nil, kinds: [MessageKind]? = nil, senderId: String? = nil,
                 before: Double? = nil, limit: Int = 50) async throws -> [Message] {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !q.isEmpty || !(kinds ?? []).isEmpty else { return [] }
+        guard !q.isEmpty || !(kinds ?? []).isEmpty || senderId != nil else { return [] }
         guard can("search"), bridge != nil else {
-            return SearchText.localSearch(messages, query: q, chatId: chatId, kinds: kinds, before: before, limit: limit)
+            return SearchText.localSearch(messages, query: q, chatId: chatId, kinds: kinds, senderId: senderId, before: before, limit: limit)
         }
         var p: [String: JSONValue] = ["query": .string(q), "limit": .number(Double(limit))]
         if let chatId { p["chatId"] = .string(chatId) }
+        if let senderId { p["senderId"] = .string(senderId) }
         if let kinds, !kinds.isEmpty { p["kinds"] = .array(kinds.map { .string($0.rawValue) }) }
         if let before { p["before"] = .number(before) }
         let r = try await call("messages.search", p)
@@ -633,7 +698,8 @@ final class PlatformSession {
         revealing = chatId
         defer { if revealing == chatId { revealing = nil } }
         if messages[chatId] == nil { await loadMessages(chatId) }
-        func loaded() -> Bool { messages[chatId]?.contains { $0.id == m.id } ?? false }
+        // A WhatsApp reply can point at an album's hidden parent, whose id is the items' groupId.
+        func loaded() -> Bool { messages[chatId]?.contains { $0.id == m.id || $0.groupId == m.id } ?? false }
         var pages = 0
         while !loaded(), pages < maxPages {
             while loadingHistory.contains(chatId) { try? await Task.sleep(nanoseconds: 50_000_000) }
@@ -1298,7 +1364,10 @@ final class PlatformSession {
         if let i = list.firstIndex(where: { $0.id == m.id }) {
             var merged = m
             if merged.media?.path == nil { merged.media?.path = list[i].media?.path }
+            let moved = merged.timestamp != list[i].timestamp
             list[i] = merged
+            // Bridges correct an album's order by re-timing its items.
+            if moved { list.sort { $0.timestamp < $1.timestamp } }
         } else if !isUpdate || messages[m.chatId] != nil {
             if m.fromMe, let i = list.firstIndex(where: { $0.status == .pending && $0.text == m.text }) {
                 list.remove(at: i)

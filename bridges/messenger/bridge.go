@@ -215,6 +215,9 @@ func (b *bridge) hello() {
 	if err := b.st.load(); err != nil {
 		b.log.Warn().Err(err).Msg("could not load store.json, starting empty")
 	}
+	// From here on, profile pictures whose CDN URL is already known are copied locally
+	// (paced, no cookies, CDN host only; see avatars.go).
+	b.st.avatars.enable()
 	b.go_("restore", func() {
 		// A login request may overtake this restore; only report the initial state
 		// when nothing has touched the session yet.

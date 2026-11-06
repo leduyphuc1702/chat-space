@@ -110,6 +110,10 @@ struct PinnedBar: View {
                     }
                     .buttonStyle(.plain)
                     .help(style.jumpHelp)
+                    if pins.count == 1 && session.platform == .telegram {
+                        TGIcon(name: "Icon_ChatPinnedMessage", fallback: "pin", size: 22).foregroundStyle(style.secondary)
+                            .help("Pinned Message")
+                    }
                     if pins.count > 1 {
                         Button { showList = true } label: { listLabel(pins.count) }
                             .buttonStyle(.plain)
@@ -171,7 +175,7 @@ struct PinnedBar: View {
     private func listLabel(_ count: Int) -> some View {
         switch session.platform {
         case .telegram:
-            TGIcon(name: "Icon_ChatPinnedMessages", fallback: "list.bullet", size: 22).foregroundStyle(style.secondary)
+            TGIcon(name: "Icon_ChatPinnedList", fallback: "pin", size: 22).foregroundStyle(style.secondary)
         case .zalo:
             Text("+\(count - 1) ghim").font(font(12, .medium)).foregroundStyle(style.text)
                 .padding(.horizontal, 8).padding(.vertical, 3)

@@ -373,8 +373,9 @@ struct MessengerConversation: View {
                         Text(MS.gapTitle(row.message.date)).font(.system(size: 12, weight: .medium)).foregroundStyle(MS.secondary)
                             .frame(maxWidth: .infinity).padding(.vertical, 12)
                     }
+                    if let n = row.unreadDivider { UnreadDivider(platform: .messenger, count: n) }
                     MessengerMessageRow(session: session, chat: chat, row: row, showStatus: row.id == lastOut)
-                        .revealHighlight(session, chatId: chat.id, id: row.id)
+                        .revealHighlight(session, chatId: chat.id, row: row)
                         .padding(.top, row.isFirstInGroup && !row.showTimeGap ? 8 : 1)
                     if row.id == chat.encryptedAfter { encryptionDivider }
                 }
@@ -500,19 +501,24 @@ struct MessengerMessageRow: View {
         } else {
             VStack(alignment: m.fromMe ? .trailing : .leading, spacing: 2) {
                 if !m.fromMe && chat.isGroup && row.isFirstInGroup {
-                    Text(m.senderName ?? "").font(.system(size: 12)).foregroundStyle(MS.secondary).padding(.leading, 48)
+                    Text(m.senderName ?? "").font(.system(size: 12)).foregroundStyle(MS.secondary)
+                        .memberProfile(session: session, chat: chat, message: m)
+                        .padding(.leading, 48)
                 }
                 if let r = m.replyTo { replyHeader(r) }
                 HStack(alignment: .bottom, spacing: 8) {
                     if m.fromMe { Spacer(minLength: ChatMetrics.gap(100, compact)) }
                     if !m.fromMe {
-                        if row.isLastInGroup { MessengerAvatar(source: m.senderAvatar ?? (chat.isGroup ? nil : chat.avatar), size: 28) }
-                        else { Color.clear.frame(width: 28, height: 1) }
+                        if row.isLastInGroup {
+                            MessengerAvatar(source: m.senderAvatar ?? (chat.isGroup ? nil : chat.avatar), size: 28)
+                                .memberProfile(session: session, chat: chat, message: m)
+                        } else { Color.clear.frame(width: 28, height: 1) }
                     }
-                    if m.fromMe && active { actions }
                     MessengerBubble(session: session, row: row, picking: $picking)
                         .messageContextMenu(session: session, message: m, labels: .vietnamese, reactions: ReactionSets.messenger)
-                    if !m.fromMe && active { actions }
+                        .besideBubble(fromMe: m.fromMe, spacing: 8, vertical: .center) {
+                            if active { actions }
+                        }
                     if !m.fromMe { Spacer(minLength: ChatMetrics.gap(100, compact)) }
                     if m.fromMe {
                         Group {
@@ -545,7 +551,7 @@ struct MessengerMessageRow: View {
                 .help("Trả lời")
         }
         .buttonStyle(.plain).font(.system(size: 14)).foregroundStyle(Color(hex: 0x8A8D91))
-        .padding(.bottom, 8)
+        .padding(.bottom, m.hasReactions ? 14 : 0)
     }
 
     private func replyHeader(_ r: ReplyRef) -> some View {
@@ -571,7 +577,7 @@ struct MessengerBubble: View {
     private var m: Message { row.message }
 
     var body: some View {
-        let isSticker = m.kind == .sticker || (m.kind == .text && isJumboEmoji(m.text))
+        let isSticker = row.album == nil && (m.kind == .sticker || (m.kind == .text && isJumboEmoji(m.text)))
         Group {
             if m.isDeleted {
                 Text(m.fromMe ? "Bạn đã thu hồi một tin nhắn" : "Tin nhắn đã bị thu hồi")
@@ -581,6 +587,23 @@ struct MessengerBubble: View {
             } else if isSticker {
                 if m.kind == .sticker { MediaContent(session: session, message: m, maxWidth: 120) }
                 else { Text(m.text ?? "").font(.system(size: 40)) }
+            } else if row.album != nil {
+                VStack(alignment: m.fromMe ? .trailing : .leading, spacing: 2) {
+                    if !row.albumMedia.isEmpty {
+                        AlbumGrid(session: session, items: row.albumMedia, width: 300, spacing: 2)
+                            .clipShape(shape)
+                    }
+                    ForEach(row.albumOthers) { f in
+                        FileContent(session: session, message: f, iconColor: m.fromMe ? .white.opacity(0.25) : Color(hex: 0xBCC0C4),
+                                    titleColor: m.fromMe ? .white : MS.text, subtitleColor: m.fromMe ? .white.opacity(0.8) : MS.secondary)
+                            .padding(.horizontal, 12).padding(.vertical, 8)
+                            .background(shape.fill(m.fromMe ? AnyShapeStyle(MS.outGradient) : AnyShapeStyle(MS.inBubble)))
+                    }
+                    if let t = row.albumCaption {
+                        textBody(t).padding(.horizontal, 12).padding(.vertical, 8)
+                            .background(shape.fill(m.fromMe ? AnyShapeStyle(MS.outGradient) : AnyShapeStyle(MS.inBubble)))
+                    }
+                }
             } else {
                 switch m.kind {
                 case .image, .video, .gif:
@@ -595,6 +618,10 @@ struct MessengerBubble: View {
                                 titleColor: m.fromMe ? .white : MS.text, subtitleColor: m.fromMe ? .white.opacity(0.8) : MS.secondary)
                         .padding(.horizontal, 12).padding(.vertical, 8)
                         .background(shape.fill(m.fromMe ? AnyShapeStyle(MS.outGradient) : AnyShapeStyle(MS.inBubble)))
+                case .call:
+                    CallContent(message: m, titleColor: MS.text, subtitleColor: MS.secondary)
+                        .padding(.horizontal, 12).padding(.vertical, 8)
+                        .background(shape.fill(MS.inBubble))
                 default:
                     textBody(m.text ?? "")
                         .padding(.horizontal, 12).padding(.vertical, 8)
@@ -626,11 +653,8 @@ struct MessengerBubble: View {
 
     private func textBody(_ t: String) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(linkified(t, linkColor: m.fromMe ? .white : MS.text, underline: true))
-                .font(.system(size: 15))
-                .foregroundStyle(m.fromMe ? .white : MS.text)
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
+            BodyText(text: t, links: m.links, font: .system(size: 15), nsFont: .systemFont(ofSize: 15),
+                     color: m.fromMe ? .white : MS.text, linkColor: m.fromMe ? .white : MS.text, underlineLinks: true)
             if Translator.shared.isShown(m) {
                 TranslationQuote(message: m, bar: m.fromMe ? .white.opacity(0.7) : MS.secondary,
                                  color: m.fromMe ? .white.opacity(0.9) : MS.text.opacity(0.75))

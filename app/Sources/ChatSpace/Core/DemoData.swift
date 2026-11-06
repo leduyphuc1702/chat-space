@@ -125,11 +125,37 @@ enum DemoData {
             msg("g5", group, "u2", "Tuấn Nguyễn", 5, "Chốt 3h thứ 7 ☕️", reactions: [Reaction(emoji: "❤️", count: 2, fromMe: false), Reaction(emoji: "😆", count: 1, fromMe: false)]),
         ]
 
-        s.messages = [direct: conv, group: groupConv]
+        // Older history, so the group opens at its first unread message with the arrow down to the newest.
+        let lines = ["Mọi người xem lại file brief giúp mình", "Ok để mình check", "Màu chủ đạo vẫn giữ xanh dương nhé",
+                     "Logo mới đẹp hơn hẳn", "Chiều nay ai rảnh review không?", "Mình rảnh sau 4h", "Đã cập nhật bản v2 lên Drive",
+                     "Font tiêu đề hơi to", "Giảm xuống 28 được không?", "Được, để mình sửa", "Thêm icon cho mục liên hệ nữa",
+                     "Ok noted", "Khách hàng duyệt phần header rồi", "Tuyệt vời 🎉", "Phần footer còn thiếu link mạng xã hội"]
+        let who: [(String?, String?)] = [("u2", "Tuấn Nguyễn"), ("u3", "Hà Phạm"), (nil, nil), ("u4", "Hoàng Long")]
+        var older: [Message] = []
+        for i in 0..<30 {
+            let w = who[(i * 7 + i / 3) % who.count]
+            older.append(msg("h\(i)", group, w.0, w.1, 400 - Double(i) * 10, lines[i % lines.count]))
+        }
+        var link = msg("g6", group, "u4", "Hoàng Long", 4.5, "Tài liệu hướng dẫn ở đây nhé, xem trước buổi họp: https://chatspace.vn/docs/brand")
+        link.links = [TextLink(offset: 0, length: 8, url: "https://chatspace.vn/docs")]
+        let albumItems: [Message] = [
+            msg("g7a", group, "u3", "Hà Phạm", 4, "", kind: .image, media: Media(mime: "image/png", path: sampleImage(), width: 1200, height: 800)),
+            msg("g7b", group, "u3", "Hà Phạm", 4, "Ảnh chụp buổi workshop hôm qua 📸", kind: .image,
+                media: Media(mime: "image/png", path: sampleReceipt(), width: 900, height: 1100)),
+            msg("g7c", group, "u3", "Hà Phạm", 4, "", kind: .image, media: Media(mime: "image/png", path: sampleImage(), width: 1200, height: 800)),
+        ].enumerated().map { i, m in
+            var m = m
+            m.groupId = "alb1"
+            m.timestamp += Double(i)
+            return m
+        }
+        let call = msg("g8", group, "u2", "Tuấn Nguyễn", 3, "Cuộc gọi thoại nhỡ", kind: .call)
+        let groupFull = older + groupConv + [link] + albumItems + [call]
+        s.messages = [direct: conv, group: groupFull]
         s.reachedStart = [direct, group]
         s.chats = [
             Chat(id: direct, title: "Lan Anh", kind: .direct, unread: 1, timestamp: now - 2 * min, lastMessage: conv.last, online: true),
-            Chat(id: group, title: "Team Thiết Kế", kind: .group, unread: 3, timestamp: now - 5 * min, lastMessage: groupConv.last, memberCount: 8),
+            Chat(id: group, title: "Team Thiết Kế", kind: .group, unread: 6, timestamp: now - 3 * min, lastMessage: groupFull.last, memberCount: 8),
             Chat(id: "c3", title: "Hoàng Long", kind: .direct, unread: 0, pinned: true, timestamp: now - 60 * 3 * min,
                  lastMessage: msg("x1", "c3", nil, nil, 180, "Cảm ơn bạn nhiều nhé!"), lastSeen: now - 40 * min),
             Chat(id: "c4", title: "Gia đình 🏡", kind: .group, unread: 12, mutedUntil: -1, timestamp: now - 60 * 20 * min,
@@ -225,7 +251,7 @@ enum DemoData {
         s.selectedChatId = ProcessInfo.processInfo.environment["CHATSPACE_DEMO_EMPTY"] != nil ? nil
             : (s.platform == .telegram || s.platform == .whatsapp ? group : direct)
         s.typing = s.platform == .zalo ? ["c3": [TypingInfo(userId: "u4", name: "Hoàng Long")]] : [:]
-        if let id = s.selectedChatId { s.loadPins(id) }
+        if let id = s.selectedChatId { s.prepare(id) }
         s.authState = .loggedIn
         if let delay = ProcessInfo.processInfo.environment["CHATSPACE_DEMO_NOTIFY"].flatMap(Double.init),
            s.platform == ProcessInfo.processInfo.environment["CHATSPACE_DEMO_NOTIFY_PLATFORM"].flatMap(Platform.init(rawValue:)) ?? .whatsapp {

@@ -37,11 +37,12 @@ enum SearchText {
 
     /// Search over messages already in memory (demo mode and bridges without `search`).
     static func localSearch(_ byChat: [String: [Message]], query: String, chatId: String?, kinds: [MessageKind]?,
-                            before: Double?, limit: Int) -> [Message] {
+                            senderId: String? = nil, before: Double?, limit: Int) -> [Message] {
         let words = terms(query)
         let lists = chatId.map { [byChat[$0] ?? []] } ?? Array(byChat.values)
         let hits = lists.joined().filter { m in
             !m.isDeleted && kindMatches(m, kinds) && (before.map { m.timestamp < $0 } ?? true)
+                && (senderId.map { m.senderId == $0 && !m.fromMe } ?? true)
                 && contains(haystack(m), all: words)
         }
         return Array(hits.sorted { $0.timestamp > $1.timestamp }.prefix(limit))

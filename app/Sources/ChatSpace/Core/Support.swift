@@ -132,9 +132,12 @@ struct RemoteImage<Placeholder: View>: View {
     @State private var loadedSource: String?
 
     var body: some View {
+        // Rows scrolled back into view are rebuilt: take a cached image in the same pass so they don't
+        // blink through the placeholder for a frame.
+        let shown = (loadedSource == source ? image : nil) ?? source.flatMap { ImageLoader.shared.cached($0, maxPixel: maxPixel) }
         Group {
-            if let image, loadedSource == source {
-                Image(nsImage: image).resizable().aspectRatio(contentMode: contentMode)
+            if let shown {
+                Image(nsImage: shown).resizable().aspectRatio(contentMode: contentMode)
             } else {
                 placeholder()
             }
@@ -144,7 +147,13 @@ struct RemoteImage<Placeholder: View>: View {
             if let c = ImageLoader.shared.cached(source, maxPixel: maxPixel) {
                 image = c; loadedSource = source; return
             }
-            let img = await ImageLoader.shared.load(source, maxPixel: maxPixel)
+            var img = await ImageLoader.shared.load(source, maxPixel: maxPixel)
+            if img == nil, source.hasPrefix("http") {
+                // A CDN hiccup must not leave an avatar blank for the rest of the session.
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                if Task.isCancelled { return }
+                img = await ImageLoader.shared.load(source, maxPixel: maxPixel)
+            }
             image = img
             loadedSource = source
         }

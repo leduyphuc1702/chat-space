@@ -154,8 +154,25 @@ interface Message {
   replyKeyboard?: ReplyKeyboard;  // this message installs a bot keyboard for the chat …
   hideKeyboard?: boolean;         // … or removes it (ReplyKeyboardHide)
   forceReply?: { placeholder?: string; oneTime?: boolean };  // the bot asks for a reply to this message
+  groupId?: string;       // album: messages sent together (several photos, photos + caption) share it
+  links?: { offset: number; length: number; url: string }[];  // text links whose URL is not in `text` (UTF-16 offsets)
 }
 ```
+
+Messages with the same `groupId` are drawn as one bubble (a photo grid with the caption under it), as
+each official app does: Telegram `groupedId`, WhatsApp album children, Messenger attachments of one
+message, Zalo photos sent as one group. Bridges that split one platform message into several
+`Message`s (one per attachment) must give them the same `groupId` and consecutive timestamps.
+
+`text` is always what a person reads: mentions appear as `@Name`, never as a user id or phone number.
+URLs written in the text are found by the app itself; `links` is only for text that links somewhere
+else (Telegram text URLs, Messenger/WhatsApp link previews whose text omits the URL).
+
+Telegram details: album items are separate messages sharing a `groupId` (`groupedId`) and one `date` in whole
+seconds, so the bridge spreads equal timestamps of one album by 1 ms in message-id order (the app sorts by
+timestamp); `links` lists hidden-URL words, URLs written without a scheme (`url` gets `https://`) and e-mail
+addresses (`mailto:`); `replyTo.text/senderName/kind` are filled from the replied-to message (one batched
+lookup per page; a deleted target leaves just `{id}`), keeping Telegram's own quote excerpt as `replyTo.text`.
 
 ## Methods
 
@@ -170,8 +187,9 @@ interface Message {
 | `chats.list` | `{ limit?: number }` | `{ chats: Chat[] }` (sorted: pinned first, then timestamp desc) |
 | `chats.avatar` | `{ chatId }` | `{ avatar?: string }` (lazy avatar resolution) |
 | `chats.members` | `{ chatId }` | `{ members: { id: string, name: string, avatar?: string }[] }` (capability `mentions`, see [Mentions](#mentions)) |
+| `chats.direct` | `{ userId }` | `{ chat: Chat }` — the one-to-one chat with a group member (`Message.senderId`), found or opened (capability `direct_chat`, see [Private chat with a member](#private-chat-with-a-member)) |
 | `messages.list` | `{ chatId, limit?: number, before?: string /* messageId */ }` | `{ messages: Message[] }` (ascending by time) |
-| `messages.search` | `{ query?: string, chatId?: string, kinds?: string[], before?: number /* ms */, limit?: number }` | `{ messages: Message[] }` (newest first; capability `search`, see [Search](#search)) |
+| `messages.search` | `{ query?: string, chatId?: string, senderId?: string, kinds?: string[], before?: number /* ms */, limit?: number }` | `{ messages: Message[] }` (newest first; capability `search`, see [Search](#search)) |
 | `messages.send` | `{ chatId, text?, replyTo?: string, filePath?: string, mentions?: { userId: string, offset: number, length: number }[] }` | `{ message: Message }` |
 | `messages.forward` | `{ fromChatId, messageId, toChatId }` | `{ message: Message }` (capability `forward`, see [Forwarding](#forwarding)) |
 | `messages.markRead` | `{ chatId }` | `{}` |
@@ -342,12 +360,14 @@ Capability `mentions` means the bridge implements `chats.members` and the `menti
   dropped silently: the message is still sent, just without that highlight.
 - `userId` is an `id` returned by `chats.members` for the same chat.
 - Zalo honours mentions in groups only (1:1 chats ignore them). The returned `Message.text` is the
-  text as the user typed it, except on WhatsApp where each span is rewritten to `@<number>` (the form
-  WhatsApp renders from `mentionedJid`) and the message echoes the text that was actually sent.
+  text as the user typed it. WhatsApp puts `@<number>` on the wire (the form WhatsApp renders from
+  `mentionedJid`), but the returned and stored text keeps `@Name`; incoming `@<number>` / `@<lid>` tokens
+  are rewritten to `@Name` too.
 - Telegram sends a message that carries mentions as plain text plus the mention entities (no Markdown
   parsing, unlike messages without mentions, because explicit entities replace the parser).
 - Messenger end-to-end encrypted chats carry the mention as an `@<fbid>@msgr` token plus `MentionedJID`
-  (as mautrix-meta does); the stored/returned message keeps the typed `@Name`.
+  (as mautrix-meta does); the stored/returned message keeps the typed `@Name`. Incoming tokens (and mention
+  spans that cover a bare id) are rewritten to `@Name` from the contact table, `@Facebook user` when unknown.
 
 ### Search
 
@@ -356,13 +376,30 @@ or file name across all chats (or one chat with `chatId`).
 
 - Every word of `query` must appear, in any order; matching ignores case, Vietnamese accents and đ/d
   (`hop dong` finds `Hợp đồng`). An empty `query` with `kinds` lists messages of those kinds.
+- `senderId` keeps only messages from that sender (the profile panel's media/files/links of one
+  member). With `senderId` and no `query`/`kinds`, every message of that sender is listed.
 - `kinds` filters by `Message.kind`; `link` also matches text messages that contain a URL. Without
   `kinds`, deleted, system and call messages are left out.
 - `limit` defaults to 50 (max 200). The next page passes `before` = the oldest returned `timestamp`.
 - Zalo, WhatsApp and Messenger search the bridge's local store only (what was synced to this
   computer); Messenger never contacts Meta for a search. Telegram asks the server
   (`messages.search` / `messages.searchGlobal`) and merges matches from recently received messages.
+  `kinds` become server filters (image → Photos, video → Video, image+video → PhotoVideo, file → Document,
+  link → Url, voice → Voice, audio → Music, gif → Gif; several kinds without a common filter are several
+  requests) and `senderId` becomes `fromId`, so an empty `query` with `kinds`, `senderId` and `chatId` lists a
+  member's shared media straight from the server. Without `chatId` there is no server-side sender filter: only
+  the sender's matches among what the server returns (and recent messages) are listed. Results the server could
+  not narrow are filtered afterwards and the next server page is read to fill the page.
 - Text inside images is not searched by bridges; the app keeps its own OCR index for that.
+
+### Private chat with a member
+
+Clicking a member's avatar in a group offers to message them privately. The app first looks for a
+`direct` chat whose `id` equals the member's `senderId` (on Zalo, `u:<senderId>`); when there is none it calls
+**`chats.direct { userId }`** (capability `direct_chat`), where `userId` is a `Message.senderId` from that
+platform. The bridge returns the `Chat` that `messages.send` / `messages.list` accept for that person,
+creating no message: an empty chat is fine. It must not send anything to the person. Errors use the
+usual error frame (e.g. the platform does not allow messaging non-contacts).
 
 ### Forwarding
 

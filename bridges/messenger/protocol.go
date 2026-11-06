@@ -42,6 +42,14 @@ type Reaction struct {
 	FromMe bool   `json:"fromMe"`
 }
 
+// Link is a span of Message.Text (UTF-16 code units, like mentions) that links to a URL which
+// is not itself written in the text: a link preview whose text omits the URL.
+type Link struct {
+	Offset int    `json:"offset"`
+	Length int    `json:"length"`
+	URL    string `json:"url"`
+}
+
 type Message struct {
 	ID           string     `json:"id"`
 	ChatID       string     `json:"chatId"`
@@ -59,6 +67,11 @@ type Message struct {
 	Deleted      bool       `json:"deleted,omitempty"`
 	Reactions    []Reaction `json:"reactions,omitempty"`
 	Status       string     `json:"status,omitempty"`
+	// GroupID ties together the messages of one album (several photos sent together, photos
+	// plus a caption): they share it and have consecutive timestamps.
+	GroupID string `json:"groupId,omitempty"`
+	// Links are text spans that link to a URL not present in Text.
+	Links []Link `json:"links,omitempty"`
 }
 
 // Chat.MarkedUnread is deliberately absent: Messenger's LightSpeed tables have no
