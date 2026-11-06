@@ -517,16 +517,19 @@ struct ZaloConversation: View {
                            padding: EdgeInsets(top: 12, leading: 0, bottom: 12, trailing: 0)) { rows in
                     let lastOut = rows.last(where: { $0.message.fromMe })?.id
                     ForEach(rows) { row in
-                        if row.showTimeGap {
-                            Text(ZL.separator(row.message.date)).font(.zalo(12)).foregroundStyle(.white)
-                                .padding(.horizontal, 10).padding(.vertical, 3)
-                                .background(Capsule().fill(Color(hex: 0x8A99AD).opacity(0.75)))
-                                .frame(maxWidth: .infinity).padding(.vertical, 12)
+                        // One view per row: the scroll position tracks rows by id.
+                        VStack(spacing: 0) {
+                            if row.showTimeGap {
+                                Text(ZL.separator(row.message.date)).font(.zalo(12)).foregroundStyle(.white)
+                                    .padding(.horizontal, 10).padding(.vertical, 3)
+                                    .background(Capsule().fill(Color(hex: 0x8A99AD).opacity(0.75)))
+                                    .frame(maxWidth: .infinity).padding(.vertical, 12)
+                            }
+                            if let n = row.unreadDivider { UnreadDivider(platform: .zalo, count: n) }
+                            ZaloMessageRow(session: session, chat: chat, row: row, showStatus: row.id == lastOut)
+                                .revealHighlight(session, chatId: chat.id, row: row)
+                                .padding(.top, row.isFirstInGroup && !row.showTimeGap ? 10 : 3)
                         }
-                        if let n = row.unreadDivider { UnreadDivider(platform: .zalo, count: n) }
-                        ZaloMessageRow(session: session, chat: chat, row: row, showStatus: row.id == lastOut)
-                            .revealHighlight(session, chatId: chat.id, row: row)
-                            .padding(.top, row.isFirstInGroup && !row.showTimeGap ? 10 : 3)
                     }
                 }
             }

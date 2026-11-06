@@ -682,18 +682,21 @@ export function parsePinTopics(items: unknown[]): PinTopic[] {
 
 /**
  * Message for a pin whose original is not stored. Sticker media and the sender's contact name are for the caller to
- * fill in; `timestamp` is the pin time (Zalo gives no other).
+ * fill in; `timestamp` is the send time read from the client id (the sender's clock in ms) when that is plausible,
+ * else the pin time. The app pages back until the history is older than it, so a pin time stops that search too soon.
  */
 export function pinToMessage(pin: PinTopic, chatId: string, selfId: string, now = Date.now()): Message {
   const senderId = pin.senderUid === "0" ? selfId : pin.senderUid;
   const { kind, text, media } = pin.mapped;
+  const pinned = pin.pinnedAt || now;
+  const sent = Number(pin.cliMsgId);
   return {
     id: pin.msgId || pin.cliMsgId,
     chatId,
     senderId,
     senderName: pin.senderName,
     fromMe: !!senderId && senderId === selfId,
-    timestamp: pin.pinnedAt || now,
+    timestamp: sent > 1_000_000_000_000 && sent <= pinned ? sent : pinned,
     kind,
     text,
     media,

@@ -1652,7 +1652,7 @@ export class TelegramAdapter extends Adapter {
   async searchMessages(p: SearchParams): Promise<Message[]> {
     const client = this.requireClient();
     return this.guard(async () => {
-      const filters = searchFilters(p.kinds);
+      let filters = searchFilters(p.kinds);
       const maxDate = p.before ? Math.floor(p.before / 1000) : 0;
       const serverLimit = Math.min(p.limit, SEARCH_PAGE_LIMIT);
       const peer = p.chatId ? await this.inputPeer(p.chatId) : undefined;
@@ -1664,33 +1664,57 @@ export class TelegramAdapter extends Adapter {
           from = undefined; // sender not known to this session: the server cannot filter, the check below does
         }
       }
+      // Basic groups answer INPUT_FILTER_INVALID to a sender together with a type filter: keep the sender
+      // (far fewer messages) and check the kinds here.
+      if (peer instanceof Api.InputPeerChat && from) filters = [new Api.InputMessagesFilterEmpty()];
       const bounds = new Matcher({ ...p, query: "" });
       const boundsAnyKind = new Matcher({ ...p, query: "", kinds: undefined }); // for the server's Url filter
 
-      const read = async (filter: Api.TypeMessagesFilter): Promise<Message[]> => {
-        const accept = filter instanceof Api.InputMessagesFilterUrl ? boundsAnyKind : bounds;
+      const read = async (wanted: Api.TypeMessagesFilter): Promise<Message[]> => {
+        let filter = wanted;
+        let fromId = from;
+        let accept = filter instanceof Api.InputMessagesFilterUrl ? boundsAnyKind : bounds;
         const got: Message[] = [];
         let offsetId = 0;
         let offsetRate = 0;
         let offsetPeer: Api.TypeInputPeer = new Api.InputPeerEmpty();
+        // Any other chat refusing a sender and/or type filter: drop the type filter first (the sender
+        // narrows more), then the sender, and check here instead.
+        const relax = (e: unknown): boolean => {
+          if ((e as { errorMessage?: string })?.errorMessage !== "INPUT_FILTER_INVALID") return false;
+          console.error(
+            `messages.search INPUT_FILTER_INVALID: filter=${filter.className} peer=${peer?.className} from=${fromId?.className ?? "-"} q=${p.query ? "yes" : "no"}`,
+          );
+          if (!(filter instanceof Api.InputMessagesFilterEmpty)) {
+            filter = new Api.InputMessagesFilterEmpty();
+            accept = bounds;
+          } else if (fromId) fromId = undefined;
+          else return false;
+          return true;
+        };
         for (let page = 0; page < SEARCH_MAX_PAGES && got.length < p.limit; page++) {
           const r = peer
-            ? await client.invoke(
-                new Api.messages.Search({
-                  peer,
-                  q: p.query,
-                  fromId: from,
-                  filter,
-                  minDate: 0,
-                  maxDate,
-                  offsetId,
-                  addOffset: 0,
-                  limit: serverLimit,
-                  maxId: 0,
-                  minId: 0,
-                  hash: helpers.returnBigInt(0),
-                }),
-              )
+            ? await client
+                .invoke(
+                  new Api.messages.Search({
+                    peer,
+                    q: p.query,
+                    fromId,
+                    filter,
+                    minDate: 0,
+                    maxDate,
+                    offsetId,
+                    addOffset: 0,
+                    limit: serverLimit,
+                    maxId: 0,
+                    minId: 0,
+                    hash: helpers.returnBigInt(0),
+                  }),
+                )
+                .catch((e: unknown) => {
+                  if (relax(e)) return null;
+                  throw e;
+                })
             : await client.invoke(
                 new Api.messages.SearchGlobal({
                   q: p.query,
@@ -1703,6 +1727,10 @@ export class TelegramAdapter extends Adapter {
                   limit: serverLimit,
                 }),
               );
+          if (r === null) {
+            page--; // same page, narrowed here
+            continue;
+          }
           if (r instanceof Api.messages.MessagesNotModified) break;
           for (const e of [...r.users, ...r.chats]) this.rememberEntity(e as Entity);
           const raws = r.messages as RawMessage[];

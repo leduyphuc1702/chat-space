@@ -81,6 +81,7 @@ final class MemberMedia {
     private var photoCursor: Double?
     private var photosOpen = false
     private var generation = 0
+    private(set) var loadedSignature: String?
     private let pageSize = 60
 
     init(session: PlatformSession, chatId: String, member: Member) {
@@ -95,6 +96,8 @@ final class MemberMedia {
 
     func reload() async {
         generation += 1
+        loadedSignature = signature
+        loading = false // a request still running belongs to the old generation and is dropped
         items = []
         cursor = nil
         photoCursor = nil
@@ -183,7 +186,7 @@ struct MemberProfileView: View {
             await m.reload()
         }
         .task(id: model?.signature) {
-            guard let model else { return }
+            guard let model, model.loadedSignature != model.signature else { return }
             try? await Task.sleep(nanoseconds: 250_000_000)
             if Task.isCancelled { return }
             await model.reload()

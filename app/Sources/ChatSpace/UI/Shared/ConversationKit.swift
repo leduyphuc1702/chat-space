@@ -97,6 +97,9 @@ struct ChatScroll<Content: View>: View {
     /// Bottom-most visible row; the scroll view keeps it in place when pages are added above or rows below
     /// get their real heights.
     @State private var position: String?
+    /// Row the last search/pin jump landed on, until the reader scrolls. A scroll made in code does not update
+    /// `position`, so pages added above (paging back to the next pin) would push the view into old history.
+    @State private var jumpedTo: String?
 
     var body: some View {
         let messages = session.messages[chatId] ?? []
@@ -145,7 +148,17 @@ struct ChatScroll<Content: View>: View {
                     atBottom = true
                 }
             }
-            .task(id: chatId) { await land(proxy) }
+            .onChange(of: position) { _, _ in jumpedTo = nil }
+            .onChange(of: messages.first?.id) { _, _ in
+                guard let row = jumpedTo else { return }
+                Task {
+                    for ms in [0, 40] as [UInt64] {
+                        try? await Task.sleep(nanoseconds: ms * 1_000_000)
+                        if jumpedTo == row { proxy.scrollTo(row, anchor: .center) }
+                    }
+                }
+            }
+            .task(id: chatId) { jumpedTo = nil; await land(proxy) }
             .onChange(of: session.scrollTarget[chatId]) { _, id in
                 guard let id, settled else { return }
                 Task { await jump(to: id, proxy) }
@@ -224,6 +237,7 @@ struct ChatScroll<Content: View>: View {
     /// (animating through hundreds of unmeasured rows is what made the chat flicker).
     private func jump(to id: String, _ proxy: ScrollViewProxy) async {
         let row = rowId(id)
+        jumpedTo = nil
         atBottom = false
         let rows = MessageGrouping.rows(session.messages[chatId] ?? [])
         let near: Bool = {
@@ -235,13 +249,25 @@ struct ChatScroll<Content: View>: View {
             withAnimation(.easeInOut(duration: 0.25)) { proxy.scrollTo(row, anchor: .center) }
             try? await Task.sleep(nanoseconds: 300_000_000)
         } else {
-            for ms in [0, 30, 90] as [UInt64] {
-                try? await Task.sleep(nanoseconds: ms * 1_000_000)
+            // Pages just added above have only estimated heights, so one scroll can stop short:
+            // keep going until the row is on screen.
+            for attempt in 0..<16 {
+                try? await Task.sleep(nanoseconds: (attempt == 0 ? 0 : 60) * 1_000_000)
                 guard session.scrollTarget[chatId] == id else { return }
                 proxy.scrollTo(row, anchor: .center)
+                if attempt >= 2, onScreen(row) { break }
             }
         }
+        jumpedTo = row
         settled = true
+    }
+
+    /// Whether `row` is above the bottom-most visible row and close to it (about a screen).
+    private func onScreen(_ row: String) -> Bool {
+        let rows = MessageGrouping.rows(session.messages[chatId] ?? [])
+        guard let p = position, let i = rows.firstIndex(where: { $0.id == row }),
+              let j = rows.firstIndex(where: { $0.id == p }) else { return false }
+        return j >= i && j - i < 15
     }
 
     private func jumpToBottom(_ proxy: ScrollViewProxy, rows: [MessageRow]) {

@@ -369,15 +369,18 @@ struct MessengerConversation: View {
                 if session.reachedStart.contains(chat.id) { intro }
                 let lastOut = rows.last(where: { $0.message.fromMe })?.id
                 ForEach(rows) { row in
-                    if row.showTimeGap {
-                        Text(MS.gapTitle(row.message.date)).font(.system(size: 12, weight: .medium)).foregroundStyle(MS.secondary)
-                            .frame(maxWidth: .infinity).padding(.vertical, 12)
+                    // One view per row: the scroll position tracks rows by id.
+                    VStack(spacing: 0) {
+                        if row.showTimeGap {
+                            Text(MS.gapTitle(row.message.date)).font(.system(size: 12, weight: .medium)).foregroundStyle(MS.secondary)
+                                .frame(maxWidth: .infinity).padding(.vertical, 12)
+                        }
+                        if let n = row.unreadDivider { UnreadDivider(platform: .messenger, count: n) }
+                        MessengerMessageRow(session: session, chat: chat, row: row, showStatus: row.id == lastOut)
+                            .revealHighlight(session, chatId: chat.id, row: row)
+                            .padding(.top, row.isFirstInGroup && !row.showTimeGap ? 8 : 1)
+                        if row.id == chat.encryptedAfter { encryptionDivider }
                     }
-                    if let n = row.unreadDivider { UnreadDivider(platform: .messenger, count: n) }
-                    MessengerMessageRow(session: session, chat: chat, row: row, showStatus: row.id == lastOut)
-                        .revealHighlight(session, chatId: chat.id, row: row)
-                        .padding(.top, row.isFirstInGroup && !row.showTimeGap ? 8 : 1)
-                    if row.id == chat.encryptedAfter { encryptionDivider }
                 }
                 if let t = session.typing[chat.id], !t.isEmpty { typingBubble }
             }

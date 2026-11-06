@@ -363,13 +363,16 @@ struct WhatsAppConversation: View {
                             .frame(maxWidth: 500).padding(.bottom, 8)
                     }
                     ForEach(rows) { row in
-                        if row.showDayHeader {
-                            WhatsAppSystemChip(text: WA.dayTitle(row.message.date)).padding(.vertical, 8)
+                        // One view per row: the scroll position tracks rows by id.
+                        VStack(spacing: 0) {
+                            if row.showDayHeader {
+                                WhatsAppSystemChip(text: WA.dayTitle(row.message.date)).padding(.vertical, 8)
+                            }
+                            if let n = row.unreadDivider { UnreadDivider(platform: .whatsapp, count: n) }
+                            WhatsAppMessageRow(session: session, chat: chat, row: row)
+                                .revealHighlight(session, chatId: chat.id, row: row)
+                                .padding(.top, row.isFirstInGroup ? 10 : 2)
                         }
-                        if let n = row.unreadDivider { UnreadDivider(platform: .whatsapp, count: n) }
-                        WhatsAppMessageRow(session: session, chat: chat, row: row)
-                            .revealHighlight(session, chatId: chat.id, row: row)
-                            .padding(.top, row.isFirstInGroup ? 10 : 2)
                     }
                 }
             }

@@ -600,6 +600,45 @@ describe("TelegramAdapter with a fake client", () => {
     expect(hits.every((m) => m.kind === "file")).toBe(true);
   });
 
+  const filterInvalid = () => Object.assign(new Error("400"), { errorMessage: "INPUT_FILTER_INVALID" });
+  const mixedPage = () =>
+    page(raw(12, { media: photo(12) }), raw(11, { media: photo(11), fromId: new Api.PeerUser({ userId: big(8) }) }), raw(10, { message: "just text" }));
+
+  test("INPUT_FILTER_INVALID: drops the type filter, then the sender, and narrows locally instead", async () => {
+    const requests: any[] = [];
+    const { adapter } = setup({
+      invoke: async (req: any) => {
+        requests.push(req);
+        if (req.fromId) throw filterInvalid();
+        return mixedPage();
+      },
+    });
+    const hits = await adapter.searchMessages({ query: "", chatId: CHAT, senderId: "7", kinds: ["image"], limit: 5 });
+    expect(requests.map((r) => [r.filter.className, r.fromId ? "from" : "-"])).toEqual([
+      ["InputMessagesFilterPhotos", "from"],
+      ["InputMessagesFilterEmpty", "from"],
+      ["InputMessagesFilterEmpty", "-"],
+    ]);
+    expect(hits.map((m) => m.id)).toEqual(["12"]);
+  });
+
+  test("a basic group asks for the member's messages with no type filter (it rejects both together) and keeps the kinds here", async () => {
+    const requests: any[] = [];
+    const { adapter, a } = setup({
+      invoke: async (req: any) => {
+        requests.push(req);
+        if (req.fromId && !(req.filter instanceof Api.InputMessagesFilterEmpty)) throw filterInvalid();
+        return mixedPage();
+      },
+    });
+    a.inputPeers.set(CHAT, new Api.InputPeerChat({ chatId: big(50) }));
+    const hits = await adapter.searchMessages({ query: "", chatId: CHAT, senderId: "7", kinds: ["image", "video", "gif"], limit: 5 });
+    expect(requests).toHaveLength(1);
+    expect(requests[0].filter).toBeInstanceOf(Api.InputMessagesFilterEmpty);
+    expect(requests[0].fromId).toBeInstanceOf(Api.InputPeerUser);
+    expect(hits.map((m) => m.id)).toEqual(["12"]);
+  });
+
   test("a sender alone with no chat has nothing the server can answer (SearchGlobal has no sender filter): local matches only", async () => {
     const requests: any[] = [];
     const { adapter } = setup({ invoke: async (req: any) => (requests.push(req), page()) });

@@ -190,6 +190,11 @@ describe("pinToMessage", () => {
     expect(m.timestamp).toBe(123);
   });
 
+  test("the client id (send time in ms) dates the message when it is before the pin", () => {
+    const p = parsePinTopic(topic({ ...base, client_msg_id: "1759000000000", msg_type: 1 }))!;
+    expect(pinToMessage(p, "g:42", "9999").timestamp).toBe(1_759_000_000_000);
+  });
+
   test("unknown sender is not 'me'", () => {
     const p = parsePinTopic(topic({ client_msg_id: "5", msg_type: 1, title: "x" }))!;
     expect(pinToMessage(p, "u:5", "").fromMe).toBe(false);

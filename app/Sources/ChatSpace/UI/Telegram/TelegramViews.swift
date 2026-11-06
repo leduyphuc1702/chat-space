@@ -344,13 +344,16 @@ struct TelegramConversation: View {
                 ChatScroll(session: session, chatId: chat.id, spacing: 0,
                            padding: EdgeInsets(top: 10, leading: 0, bottom: 10, trailing: 0)) { rows in
                     ForEach(rows) { row in
-                        if row.showDayHeader {
-                            TelegramServicePill(text: TG.dayTitle(row.message.date)).padding(.vertical, 8)
+                        // One view per row: the scroll position tracks rows by id.
+                        VStack(spacing: 0) {
+                            if row.showDayHeader {
+                                TelegramServicePill(text: TG.dayTitle(row.message.date)).padding(.vertical, 8)
+                            }
+                            if let n = row.unreadDivider { UnreadDivider(platform: .telegram, count: n) }
+                            TelegramMessageRow(session: session, chat: chat, row: row)
+                                .revealHighlight(session, chatId: chat.id, row: row)
+                                .padding(.top, row.isFirstInGroup ? 6 : 2)
                         }
-                        if let n = row.unreadDivider { UnreadDivider(platform: .telegram, count: n) }
-                        TelegramMessageRow(session: session, chat: chat, row: row)
-                            .revealHighlight(session, chatId: chat.id, row: row)
-                            .padding(.top, row.isFirstInGroup ? 6 : 2)
                     }
                 }
                 if let toast = session.botToast[chat.id] {
