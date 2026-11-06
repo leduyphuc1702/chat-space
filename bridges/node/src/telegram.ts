@@ -58,6 +58,7 @@ import {
   muteUntilSeconds,
   notifyScopeOf,
   peerKey,
+  previewSize,
   reactionEmoticonForTelegram,
   ReplyResolver,
   searchFilters,
@@ -419,7 +420,7 @@ type RawUpdate = { _entities?: Map<string, Entity> };
 export class TelegramAdapter extends Adapter {
   readonly platform = "telegram";
   // "edit" is deliberately absent: the protocol has no edit method yet.
-  readonly capabilities = ["reactions", "reply", "delete", "edit", "typing", "read_receipts", "media_send", "voice", "folders", "mentions", "forward", "search", "mute", "pins", "bot_buttons", "direct_chat"];
+  readonly capabilities = ["reactions", "reply", "delete", "edit", "typing", "read_receipts", "media_send", "voice", "folders", "mentions", "forward", "search", "mute", "pins", "bot_buttons", "direct_chat", "media_preview"];
 
   private creds?: Creds;
   private client?: TelegramClient;
@@ -615,6 +616,15 @@ export class TelegramAdapter extends Adapter {
     client.setLogLevel(LogLevel.ERROR);
     // GramJS parses outgoing text as Markdown by default; users expect their text sent verbatim.
     client.setParseMode(undefined);
+    // Files on the account's own DC download over a second connection, which GramJS points at the first config entry
+    // for that DC and retries forever if refused. DC5's first entry (91.108.56.164) refused this bridge, so every such
+    // photo hung; the address the main connection already uses is known to work.
+    const getDC = client.getDC.bind(client);
+    client.getDC = async (dcId: number, downloadDC?: boolean, web?: boolean) => {
+      const s = client.session;
+      if (!web && dcId === s.dcId && s.serverAddress) return { id: dcId, ipAddress: s.serverAddress, port: s.port || 443 };
+      return getDC(dcId, downloadDC, web);
+    };
     // Updates that come back as the result of a request (our own sends, forwards, reads) are never pushed again on
     // the stream, yet they move the account's pts: GramJS does not hand them to update handlers, so look at every
     // result here. Otherwise each message we send would look like a gap to fill.
@@ -1650,6 +1660,14 @@ export class TelegramAdapter extends Adapter {
    * and the next server page is read to fill the result, so a page is short only when the history really ends.
    */
   async searchMessages(p: SearchParams): Promise<Message[]> {
+    return (await this.searchPage(p)).messages;
+  }
+
+  /**
+   * `next` comes from how far each filter actually read: one stopped by the page cap (a sender's photos among many
+   * texts) has covered history only down to the last message it read, however few matches it kept.
+   */
+  override async searchPage(p: SearchParams): Promise<{ messages: Message[]; next: number | null }> {
     const client = this.requireClient();
     return this.guard(async () => {
       let filters = searchFilters(p.kinds);
@@ -1670,8 +1688,10 @@ export class TelegramAdapter extends Adapter {
       const bounds = new Matcher({ ...p, query: "" });
       const boundsAnyKind = new Matcher({ ...p, query: "", kinds: undefined }); // for the server's Url filter
 
-      const read = async (wanted: Api.TypeMessagesFilter): Promise<Message[]> => {
+      /** `until`: timestamp (ms) of the oldest message read when the server had more; absent when it ran out. */
+      const read = async (wanted: Api.TypeMessagesFilter): Promise<{ got: Message[]; until?: number }> => {
         let filter = wanted;
+        let until: number | undefined;
         let fromId = from;
         let accept = filter instanceof Api.InputMessagesFilterUrl ? boundsAnyKind : bounds;
         const got: Message[] = [];
@@ -1731,6 +1751,7 @@ export class TelegramAdapter extends Adapter {
             page--; // same page, narrowed here
             continue;
           }
+          until = undefined;
           if (r instanceof Api.messages.MessagesNotModified) break;
           for (const e of [...r.users, ...r.chats]) this.rememberEntity(e as Entity);
           const raws = r.messages as RawMessage[];
@@ -1740,7 +1761,7 @@ export class TelegramAdapter extends Adapter {
             this.rememberMessage(m);
             got.push(m);
           }
-          const last = raws[raws.length - 1] as { id?: number; peerId?: Api.TypePeer } | undefined;
+          const last = raws[raws.length - 1] as { id?: number; date?: number; peerId?: Api.TypePeer } | undefined;
           if (raws.length < serverLimit || !last?.id) break; // the server has no more
           offsetId = last.id;
           if (!peer) {
@@ -1748,21 +1769,31 @@ export class TelegramAdapter extends Adapter {
             offsetRate = r.nextRate;
             offsetPeer = await this.inputPeer(peerKey(last.peerId));
           }
+          if (last.date) until = last.date * 1000;
         }
-        return got;
+        return { got, until };
       };
 
       const out: Message[] = [];
+      let next: number | null = null;
       // SearchGlobal rejects "no text and no filter"; with only a sender and no chat the local matches are all there is.
       const everything = filters.length === 1 && filters[0] instanceof Api.InputMessagesFilterEmpty;
       if (peer || p.query || !everything) {
-        for (const list of await Promise.all(filters.map(read))) out.push(...list);
+        for (const { got, until } of await Promise.all(filters.map(read))) {
+          out.push(...got);
+          // +1: messages in the same second as the last one read may not have been reached yet.
+          if (until !== undefined) next = Math.max(next ?? 0, until + 1);
+        }
       }
       const local = new Matcher(p);
       for (const m of this.recent.values()) {
         if ((!p.chatId || m.chatId === p.chatId) && local.test(m)) out.push(m);
       }
-      return newestFirst(out, p.limit);
+      const messages = newestFirst(out, p.limit);
+      if (messages.length === p.limit && new Set(out.map((m) => m.chatId + "|" + m.id)).size > p.limit) {
+        next = Math.max(next ?? 0, messages[messages.length - 1].timestamp + 1);
+      }
+      return { messages, next };
     });
   }
 
@@ -2387,6 +2418,89 @@ export class TelegramAdapter extends Adapter {
       this.downloadInflight.set(file, job);
       return job;
     });
+  }
+
+  /**
+   * A grid tile's image: the photo's (or video's) mid-size thumbnail, a few dozen KB instead of the full file.
+   * Tiles appearing together share one getMessages per chat.
+   */
+  async previewMedia(chatId: string, messageId: string): Promise<string> {
+    const client = this.requireClient();
+    return this.guard(async () => {
+      const id = parseMsgId(messageId);
+      const file = join(this.mediaDir, `${chatId}_${id}.preview.jpg`);
+      const st = safeStat(file);
+      if (st && st.isFile() && st.size > 0) {
+        this.touchMedia(file, st);
+        return file;
+      }
+      const inflight = this.downloadInflight.get(file);
+      if (inflight) return inflight;
+      const job = (async () => {
+        const raw = await this.batchedMessage(chatId, id);
+        const size = raw instanceof Api.Message ? previewSize(raw.media) : undefined;
+        if (!(raw instanceof Api.Message)) throw new BridgeError("not_found", `This message has no preview (${raw?.className})`);
+        if (!size) {
+          // A picture sent as a file often carries no thumbnail: the file itself is the preview.
+          const doc = raw.media instanceof Api.MessageMediaDocument ? raw.media.document : undefined;
+          if (doc instanceof Api.Document && doc.mimeType.startsWith("image/")) return this.downloadMedia(chatId, messageId);
+          throw new BridgeError("not_found", `This message has no preview (${raw.media?.className} ${doc instanceof Api.Document ? doc.mimeType : ""})`);
+        }
+        // By type: GramJS ignores a PhotoSizeProgressive passed as an object and returns nothing.
+        const data = await client.downloadMedia(raw, { thumb: size.type as unknown as number });
+        if (!Buffer.isBuffer(data) || data.length === 0) throw new BridgeError("not_found", "This message has no preview");
+        mkdirSync(this.mediaDir, { recursive: true });
+        const tmp = `${file}.part`;
+        writeFileSync(tmp, data);
+        renameSync(tmp, file);
+        this.mediaIndex?.set(file, { size: data.length, used: Date.now() });
+        return file;
+      })()
+        .catch((e) => {
+          this.ctx.log(`media preview ${chatId}/${id} failed: ${describeError(e)}`);
+          throw e;
+        })
+        .finally(() => this.downloadInflight.delete(file));
+      this.downloadInflight.set(file, job);
+      return job;
+    });
+  }
+
+  private readonly messageBatches = new Map<string, Map<number, ((m: RawMessage | undefined, e?: unknown) => void)[]>>();
+
+  /** One message by id; ids asked for within a few ms of each other in the same chat go out as one request. */
+  private batchedMessage(chatId: string, id: number): Promise<RawMessage | undefined> {
+    return new Promise((resolve, reject) => {
+      let batch = this.messageBatches.get(chatId);
+      if (!batch) {
+        batch = new Map();
+        this.messageBatches.set(chatId, batch);
+        setTimeout(() => void this.flushMessageBatch(chatId), 40);
+      }
+      const waiting = batch.get(id) ?? [];
+      waiting.push((m, e) => (e === undefined ? resolve(m) : reject(e)));
+      batch.set(id, waiting);
+    });
+  }
+
+  private async flushMessageBatch(chatId: string) {
+    const batch = this.messageBatches.get(chatId);
+    this.messageBatches.delete(chatId);
+    if (!batch) return;
+    try {
+      const client = this.requireClient();
+      const peer = await this.inputPeer(chatId);
+      const ids = [...batch.keys()];
+      const byId = new Map<number, RawMessage>();
+      for (let i = 0; i < ids.length; i += 100) {
+        for (const m of await client.getMessages(peer, { ids: ids.slice(i, i + 100) })) {
+          if (m) byId.set(m.id, m as RawMessage);
+        }
+      }
+      for (const [id, waiting] of batch) for (const w of waiting) w(byId.get(id));
+    } catch (e) {
+      for (const waiting of batch.values()) for (const w of waiting) w(undefined, e ?? new Error("lookup failed"));
+    }
   }
 
   async sendTyping(chatId: string, typing: boolean): Promise<void> {

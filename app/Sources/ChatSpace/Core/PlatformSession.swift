@@ -74,7 +74,10 @@ final class PlatformSession {
 
     @ObservationIgnored private var bridge: BridgeProcess?
     @ObservationIgnored private var avatarRequested: Set<String> = []
+    /// The member page shown over a conversation (opened from a sender's avatar or name).
+    var memberPage: MemberPage?
     @ObservationIgnored private var downloadRequested: Set<String> = []
+    @ObservationIgnored private var previews: [String: String] = [:]
     @ObservationIgnored private var restartAttempts = 0
     @ObservationIgnored private var typingExpiry: [String: Task<Void, Never>] = [:]
     /// The user is on a QR screen and expects a scannable code at all times.
@@ -405,6 +408,7 @@ final class PlatformSession {
     }
 
     func select(_ chatId: String) {
+        if memberPage?.chatId != chatId { memberPage = nil }
         selectedChatId = chatId
         prepare(chatId)
     }
@@ -671,18 +675,34 @@ final class PlatformSession {
     /// `senderId` keeps one person's messages (with no query or kinds: all of them).
     func search(_ query: String, chatId: String? = nil, kinds: [MessageKind]? = nil, senderId: String? = nil,
                 before: Double? = nil, limit: Int = 50) async throws -> [Message] {
+        try await searchPage(query, chatId: chatId, kinds: kinds, senderId: senderId, before: before, limit: limit).messages
+    }
+
+    /// `search` plus where the next page starts (`before` for the next call), nil at the end of the history.
+    /// A bridge that filters after reading (sender, kinds) can return a short page with more to come, so it
+    /// says `next` itself; for one that does not, a full page means there may be more.
+    func searchPage(_ query: String, chatId: String? = nil, kinds: [MessageKind]? = nil, senderId: String? = nil,
+                    before: Double? = nil, limit: Int = 50) async throws -> (messages: [Message], next: Double?) {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !q.isEmpty || !(kinds ?? []).isEmpty || senderId != nil else { return [] }
-        guard can("search"), bridge != nil else {
-            return SearchText.localSearch(messages, query: q, chatId: chatId, kinds: kinds, senderId: senderId, before: before, limit: limit)
+        guard !q.isEmpty || !(kinds ?? []).isEmpty || senderId != nil else { return ([], nil) }
+        let list: [Message]
+        if can("search"), bridge != nil {
+            var p: [String: JSONValue] = ["query": .string(q), "limit": .number(Double(limit))]
+            if let chatId { p["chatId"] = .string(chatId) }
+            if let senderId { p["senderId"] = .string(senderId) }
+            if let kinds, !kinds.isEmpty { p["kinds"] = .array(kinds.map { .string($0.rawValue) }) }
+            if let before { p["before"] = .number(before) }
+            let r = try await call("messages.search", p)
+            list = try r["messages"]?.decode([Message].self) ?? []
+            switch r["next"] {
+            case .number(let n)?: return (list, n)
+            case .null?: return (list, nil)
+            default: break
+            }
+        } else {
+            list = SearchText.localSearch(messages, query: q, chatId: chatId, kinds: kinds, senderId: senderId, before: before, limit: limit)
         }
-        var p: [String: JSONValue] = ["query": .string(q), "limit": .number(Double(limit))]
-        if let chatId { p["chatId"] = .string(chatId) }
-        if let senderId { p["senderId"] = .string(senderId) }
-        if let kinds, !kinds.isEmpty { p["kinds"] = .array(kinds.map { .string($0.rawValue) }) }
-        if let before { p["before"] = .number(before) }
-        let r = try await call("messages.search", p)
-        return try r["messages"]?.decode([Message].self) ?? []
+        return (list, list.count >= limit ? list.map(\.timestamp).min() : nil)
     }
 
     /// Message briefly highlighted after a search jumped to it, per chat.
@@ -1215,6 +1235,31 @@ final class PlatformSession {
         if let r = try? await call("media.download", ["chatId": .string(message.chatId), "messageId": .string(message.id)]),
            let path = r["path"]?.stringValue { return path }
         return message.media?.url
+    }
+
+    /// A sharp picture for a grid tile or filmstrip: the downloaded file when there is one, else a mid-size rendition
+    /// from the bridge (Telegram's inline thumbnails are a blurry few pixels), else what the message carries.
+    func previewSource(_ message: Message) async -> String? {
+        let media = message.media
+        let photo = message.kind == .image
+        if photo, let p = media?.path, FileManager.default.fileExists(atPath: p) { return p }
+        let key = message.chatId + "|" + message.id
+        if let p = previews[key], FileManager.default.fileExists(atPath: p) { return p }
+        if can("media_preview") {
+            guard let r = try? await call("media.preview", ["chatId": .string(message.chatId), "messageId": .string(message.id)]),
+                  let path = r["path"]?.stringValue else { return nil }
+            previews[key] = path
+            return path
+        }
+        if photo, let u = media?.url, u.hasPrefix("http") { return u }
+        // WhatsApp keeps photos encrypted: tiles fetch them like the chat does, when auto-download allows it.
+        if photo, platform == .whatsapp, media?.url == nil, Workspace.shared.storage.autoDownloads(message),
+           let r = try? await call("media.download", ["chatId": .string(message.chatId), "messageId": .string(message.id)]),
+           let path = r["path"]?.stringValue {
+            previews[key] = path
+            return path
+        }
+        return nil
     }
 
     func openExternally(_ message: Message) {

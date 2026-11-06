@@ -49,6 +49,14 @@ export abstract class Adapter {
   async searchMessages(_p: SearchParams): Promise<Message[]> {
     throw new BridgeError("unsupported", "search is not supported");
   }
+  /**
+   * searchMessages plus `next`: the `before` that continues the search, null when the history is done. Only adapters
+   * that can tell (a short page is not the end when they filter after reading) override it; otherwise `next` is left
+   * out and the app takes a full page to mean there may be more.
+   */
+  async searchPage(p: SearchParams): Promise<{ messages: Message[]; next?: number | null }> {
+    return { messages: await this.searchMessages(p) };
+  }
   /** Platform-native forward of one message (capability "forward"). */
   async forwardMessage(_fromChatId: string, _messageId: string, _toChatId: string): Promise<Message> {
     throw new BridgeError("unsupported", "forward is not supported");
@@ -85,6 +93,10 @@ export abstract class Adapter {
   }
   async downloadMedia(_chatId: string, _messageId: string): Promise<string> {
     throw new BridgeError("unsupported", "media download is not supported");
+  }
+  /** media.preview (capability "media_preview"): a mid-size rendition of a photo/video for grids; returns a local path. */
+  async previewMedia(_chatId: string, _messageId: string): Promise<string> {
+    throw new BridgeError("unsupported", "media preview is not supported");
   }
   async sendTyping(_chatId: string, _typing: boolean): Promise<void> {}
   /**

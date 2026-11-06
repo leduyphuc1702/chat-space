@@ -98,7 +98,7 @@ const handlers: Record<string, (p: Params) => Promise<unknown>> = {
   "messages.list": async (p) => ({
     messages: await adapter.listMessages(need(p, "chatId"), p.limit ?? 50, p.before),
   }),
-  "messages.search": async (p) => ({ messages: await adapter.searchMessages(parseSearch(p)) }),
+  "messages.search": async (p) => adapter.searchPage(parseSearch(p)),
   "messages.send": async (p) => {
     need(p, "chatId");
     if (!p.text && !p.filePath) throw new BridgeError("invalid_params", "text or filePath required");
@@ -134,6 +134,9 @@ const handlers: Record<string, (p: Params) => Promise<unknown>> = {
   },
   "media.download": async (p) => ({
     path: await adapter.downloadMedia(need(p, "chatId"), need(p, "messageId")),
+  }),
+  "media.preview": async (p) => ({
+    path: await adapter.previewMedia(need(p, "chatId"), need(p, "messageId")),
   }),
   "typing.send": async (p) => {
     await adapter.sendTyping(need(p, "chatId"), !!p.typing);

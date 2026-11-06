@@ -369,13 +369,16 @@ struct TelegramConversation: View {
                     .mentionSuggestions(session: session, chat: chat, accent: TG.accent)
         }
         .fileDropTarget(session: session, chatId: chat.id, accent: TG.accent)
+        .memberPage(session: session, chat: chat)
     }
 
     private var header: some View {
         HStack(spacing: 10) {
             TelegramAvatar(id: chat.id, title: chat.title, source: chat.avatar, size: 36, isSaved: chat.kind == .self)
+                .chatPage(session: session, chat: chat)
             VStack(alignment: .leading, spacing: 1) {
                 Text(chat.kind == .self ? "Saved Messages" : chat.title).font(.system(size: 14, weight: .semibold)).lineLimit(1)
+                    .chatPage(session: session, chat: chat)
                 subtitle.font(.system(size: 12.5)).lineLimit(1)
             }
             Spacer()

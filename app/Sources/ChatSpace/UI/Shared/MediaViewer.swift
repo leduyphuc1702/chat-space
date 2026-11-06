@@ -35,6 +35,13 @@ final class MediaViewer {
             if showCost { showText = false; prepareCostEntry() }
         }
     }
+    /// Every photo of the set as a grid, to pick one from.
+    var showGrid = false
+    private(set) var loadingOlder = false
+    /// What the set is, shown over the grid ("Anny Hoang", the chat's name).
+    private(set) var galleryTitle = ""
+    /// A sharp stand-in shown while the full photo downloads.
+    private(set) var preview: String?
     private(set) var costEntries: [String: PurchaseCostEntry] = [:]
     var costEntry: PurchaseCostEntry? { current.flatMap { costEntries[$0.id] } }
 
@@ -43,6 +50,8 @@ final class MediaViewer {
     @ObservationIgnored private var keyMonitor: Any?
     @ObservationIgnored private var loadTask: Task<Void, Never>?
     @ObservationIgnored private var source: String?
+    /// The set again with older items added, or nil once there are no more.
+    @ObservationIgnored private var older: (() async -> [Message]?)?
     @ObservationIgnored private let analyzer = ImageAnalyzer()
     @ObservationIgnored weak var overlay: ImageAnalysisOverlayView?
 
@@ -55,6 +64,7 @@ final class MediaViewer {
     }
 
     var current: Message? { items.indices.contains(index) ? items[index].message : nil }
+    var platformSession: PlatformSession? { session }
     var isVideo: Bool { current.map(Self.isVideo) ?? false }
     var transcript: String { analysis?.transcript ?? "" }
 
@@ -68,12 +78,18 @@ final class MediaViewer {
 
     // MARK: Showing
 
-    func show(session: PlatformSession, message: Message, cost: Bool = false) {
+    /// `gallery` is the set to browse (oldest first) when it isn't the chat's loaded media, with `older` fetching more of it.
+    func show(session: PlatformSession, message: Message, gallery: [Message]? = nil, title setTitle: String? = nil,
+              cost: Bool = false, older: (() async -> [Message]?)? = nil) {
         if self.session !== session { costEntries = [:] }
         self.session = session
-        let all = (session.messages[message.chatId] ?? []).filter(Self.canShow)
+        let all = gallery ?? (session.messages[message.chatId] ?? []).filter(Self.canShow)
         items = (all.contains { $0.id == message.id } ? all : [message]).map { Item(id: $0.id, message: $0) }
         index = items.firstIndex { $0.id == message.id } ?? 0
+        self.older = older
+        loadingOlder = false
+        showGrid = false
+        galleryTitle = setTitle ?? session.chats.first { $0.id == message.chatId }?.title ?? ""
         let panel = window ?? makeWindow()
         window = panel
         // Above the floating chat bubble when opened from there.
@@ -85,6 +101,7 @@ final class MediaViewer {
         watchKeys()
         loadCurrent()
         if cost { showCost = true }
+        loadOlderIfNear()
     }
 
     func close() {
@@ -94,18 +111,42 @@ final class MediaViewer {
         videoURL = nil
         analysis = nil
         items = []
+        older = nil
+        showGrid = false
+        preview = nil
         costEntries = [:]
         showCost = false
         if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
         keyMonitor = nil
     }
 
-    func step(_ delta: Int) {
-        let next = index + delta
-        guard items.indices.contains(next) else { return }
-        index = next
+    func step(_ delta: Int) { select(index + delta) }
+
+    func select(_ i: Int) {
+        guard items.indices.contains(i) else { return }
+        showGrid = false
+        guard i != index || image == nil && videoURL == nil && !loading else { return }
+        index = i
         window?.title = title
         loadCurrent()
+        loadOlderIfNear()
+    }
+
+    /// Near the oldest photo (or at the end of the grid), the next older page is fetched and put in front.
+    func loadOlderIfNear(force: Bool = false) {
+        guard let older, !loadingOlder, force || index < 3 else { return }
+        loadingOlder = true
+        Task { [weak self] in
+            let more = await older()
+            guard let self, self.loadingOlder else { return }
+            self.loadingOlder = false
+            guard let more, let id = self.current?.id, more.contains(where: { $0.id == id }) else { self.older = nil; return }
+            let grew = more.count > self.items.count
+            self.items = more.map { Item(id: $0.id, message: $0) }
+            self.index = more.firstIndex { $0.id == id } ?? 0
+            self.window?.title = self.title
+            if !grew { self.older = nil }
+        }
     }
 
     func setZoom(_ z: CGFloat) { zoom = min(max(z, 1), 8) }
@@ -125,10 +166,18 @@ final class MediaViewer {
         failed = false
         zoom = 1
         source = nil
+        preview = nil
         guard let m = current, let session else { return }
         if showCost { prepareCostEntry() }
         loading = true
         let video = isVideo
+        if !video, session.can("media_preview") {
+            Task { [weak self] in
+                let p = await session.previewSource(m)
+                guard let self, self.current?.id == m.id, self.image == nil else { return }
+                self.preview = p
+            }
+        }
         loadTask = Task { [weak self] in
             let src = await session.mediaSource(m)
             guard let self, !Task.isCancelled, self.current?.id == m.id else { return }
@@ -270,9 +319,9 @@ final class MediaViewer {
         // Typing in the cost form: arrows move the caret and Esc stays with the field.
         if (w.firstResponder as? NSTextView)?.isEditable == true, [53, 123, 124].contains(key) { return false }
         switch (key, cmd) {
-        case (53, _): close()                                   // Esc
-        case (123, false): step(-1)                             // ←
-        case (124, false): step(1)                              // →
+        case (53, _): if showGrid { showGrid = false } else { close() }   // Esc
+        case (123, false) where !showGrid: step(-1)             // ←
+        case (124, false) where !showGrid: step(1)              // →
         case (24, true), (69, true): setZoom(zoom * 1.5)        // ⌘+
         case (27, true), (78, true): setZoom(zoom / 1.5)        // ⌘−
         case (29, true): setZoom(1)                             // ⌘0
@@ -307,11 +356,18 @@ struct MediaViewerView: View {
         HStack(spacing: 0) {
             ZStack {
                 Color.black.ignoresSafeArea()
-                content
-                if viewer.items.count > 1 { arrows }
-                VStack {
-                    Spacer()
-                    toolbar.opacity(hovering ? 1 : 0)
+                if viewer.showGrid, let session = viewer.platformSession {
+                    grid(session)
+                } else {
+                    content
+                    if viewer.items.count > 1 { arrows }
+                    VStack(spacing: 10) {
+                        Spacer()
+                        toolbar
+                        if viewer.items.count > 1, let session = viewer.platformSession { filmstrip(session) }
+                    }
+                    .padding(.bottom, 14)
+                    .opacity(hovering ? 1 : 0)
                 }
             }
             if viewer.showText && !viewer.isVideo {
@@ -353,6 +409,9 @@ struct MediaViewerView: View {
                 Text("Không tải được nội dung này").font(.system(size: 13))
             }
             .foregroundStyle(.white.opacity(0.7))
+        } else if let preview = viewer.preview {
+            RemoteImage(source: preview, contentMode: .fit, maxPixel: 1024) { Color.clear }
+                .overlay(alignment: .topTrailing) { ProgressView().controlSize(.small).tint(.white).padding(14) }
         } else if let thumb = viewer.current?.media?.thumbnail {
             RemoteImage(source: thumb, contentMode: .fit, maxPixel: 256) { Color.clear }
                 .blur(radius: 12).opacity(0.6)
@@ -383,6 +442,10 @@ struct MediaViewerView: View {
 
     private var toolbar: some View {
         HStack(spacing: 4) {
+            if viewer.items.count > 1 {
+                tool("square.grid.3x3", "Xem tất cả \(viewer.items.count) ảnh/video") { viewer.showGrid = true }
+                Divider().frame(height: 18).overlay(Color.white.opacity(0.25))
+            }
             if !viewer.isVideo {
                 tool("minus.magnifyingglass", "Thu nhỏ (⌘−)") { viewer.setZoom(viewer.zoom / 1.5) }.disabled(viewer.zoom <= 1)
                 tool("plus.magnifyingglass", "Phóng to (⌘+)") { viewer.setZoom(viewer.zoom * 1.5) }.disabled(viewer.image == nil)
@@ -399,7 +462,89 @@ struct MediaViewerView: View {
         }
         .padding(.horizontal, 8).padding(.vertical, 6)
         .background(Capsule().fill(.black.opacity(0.6)).overlay(Capsule().stroke(.white.opacity(0.12))))
-        .padding(.bottom, 18)
+    }
+
+    /// The rest of the set under the photo: click one to go to it.
+    private func filmstrip(_ session: PlatformSession) -> some View {
+        ScrollViewReader { proxy in
+            ScrollView(.horizontal, showsIndicators: false) {
+                LazyHStack(spacing: 4) {
+                    if viewer.loadingOlder {
+                        ProgressView().controlSize(.small).tint(.white).frame(width: 40, height: 52)
+                    }
+                    ForEach(Array(viewer.items.enumerated()), id: \.element.id) { i, item in
+                        let selected = i == viewer.index
+                        MediaThumb(session: session, message: item.message, maxPixel: 120)
+                            .frame(width: 52, height: 52)
+                            .overlay(alignment: .bottomLeading) { if Self.playable(item.message) { playBadge(8) } }
+                            .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+                            .overlay(RoundedRectangle(cornerRadius: 5, style: .continuous).stroke(.white, lineWidth: selected ? 2 : 0))
+                            .opacity(selected ? 1 : 0.62)
+                            .contentShape(Rectangle())
+                            .onTapGesture { viewer.select(i) }
+                            .id(item.id)
+                    }
+                }
+                .padding(.horizontal, 10).padding(.vertical, 6)
+            }
+            .frame(height: 64)
+            .frame(maxWidth: 760)
+            .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(.black.opacity(0.55)))
+            .padding(.horizontal, 60)
+            .onAppear { proxy.scrollTo(viewer.current?.id, anchor: .center) }
+            .onChange(of: viewer.current?.id) { _, id in
+                withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo(id, anchor: .center) }
+            }
+        }
+    }
+
+    /// The whole set, newest first like a profile's media tab; scrolling to the bottom fetches older ones.
+    private func grid(_ session: PlatformSession) -> some View {
+        VStack(spacing: 0) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(viewer.galleryTitle).font(.system(size: 15, weight: .semibold)).lineLimit(1)
+                Text("\(viewer.items.count) ảnh/video").font(.system(size: 12.5)).foregroundStyle(.white.opacity(0.55))
+                Spacer()
+                Button { viewer.showGrid = false } label: {
+                    Label("Quay lại ảnh", systemImage: "photo").font(.system(size: 12.5, weight: .medium))
+                        .padding(.horizontal, 10).padding(.vertical, 5)
+                        .background(Capsule().fill(.white.opacity(0.12)))
+                }
+                .buttonStyle(.plain)
+            }
+            .foregroundStyle(.white)
+            .padding(.horizontal, 16).padding(.top, 36).padding(.bottom, 10)
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 3)], spacing: 3) {
+                        ForEach(Array(viewer.items.enumerated().reversed()), id: \.element.id) { i, item in
+                            Color.white.opacity(0.06)
+                                .aspectRatio(1, contentMode: .fit)
+                                .overlay { MediaThumb(session: session, message: item.message, maxPixel: 400) }
+                                .overlay(alignment: .bottomLeading) { if Self.playable(item.message) { playBadge(11) } }
+                                .clipped()
+                                .overlay { if i == viewer.index { Rectangle().stroke(.white, lineWidth: 3) } }
+                                .contentShape(Rectangle())
+                                .onTapGesture { viewer.select(i) }
+                                .onAppear { if i == 0 { viewer.loadOlderIfNear(force: true) } }
+                                .id(item.id)
+                        }
+                    }
+                    .padding(.horizontal, 3)
+                    if viewer.loadingOlder {
+                        ProgressView().controlSize(.small).tint(.white).padding(16)
+                    }
+                }
+                .onAppear { proxy.scrollTo(viewer.current?.id, anchor: .center) }
+            }
+        }
+    }
+
+    private static func playable(_ m: Message) -> Bool { m.kind == .video || m.kind == .gif }
+
+    private func playBadge(_ size: CGFloat) -> some View {
+        Image(systemName: "play.fill").font(.system(size: size)).foregroundStyle(.white)
+            .padding(size * 0.45).background(Circle().fill(.black.opacity(0.5))).padding(4)
     }
 
     private var textPanel: some View {
@@ -434,6 +579,31 @@ struct MediaViewerView: View {
                 .frame(width: 34, height: 30).contentShape(Rectangle())
         }
         .buttonStyle(.plain).help(help)
+    }
+}
+
+/// A photo or video tile that stays sharp at its size: the downloaded photo or a mid-size rendition from the
+/// bridge, over the message's inline thumbnail until that arrives.
+struct MediaThumb: View {
+    let session: PlatformSession
+    let message: Message
+    var maxPixel: CGFloat = 300
+    @State private var sharp: (id: String, source: String?)?
+
+    var body: some View {
+        let media = message.media
+        let local = message.kind == .image ? media?.path : nil
+        let fetched = sharp?.id == message.id ? sharp?.source : nil
+        RemoteImage(source: local ?? fetched, contentMode: .fill, maxPixel: maxPixel) {
+            // Telegram's inline thumbnail is a few pixels across: soften it until the real one is in.
+            RemoteImage(source: media?.thumbnail, contentMode: .fill, maxPixel: 96) { Color.clear }
+                .blur(radius: session.can("media_preview") ? 4 : 0)
+        }
+        .task(id: message.id) {
+            guard local == nil else { return }
+            let p = await session.previewSource(message)
+            if !Task.isCancelled { sharp = (message.id, p) }
+        }
     }
 }
 
@@ -474,7 +644,7 @@ struct LiveTextImageView: NSViewRepresentable {
         overlay.trackingImageView = imageView
         // Not .automatic: its subject lifting turns a drag across text into dragging the photo out.
         overlay.preferredInteractionTypes = [.textSelection, .dataDetectors]
-        overlay.supplementaryInterfaceContentInsets = NSEdgeInsets(top: 0, left: 0, bottom: 64, right: 0)
+        overlay.supplementaryInterfaceContentInsets = NSEdgeInsets(top: 0, left: 0, bottom: 140, right: 0)
         overlay.autoresizingMask = [.width, .height]
         imageView.addSubview(overlay)
         scroll.documentView = imageView

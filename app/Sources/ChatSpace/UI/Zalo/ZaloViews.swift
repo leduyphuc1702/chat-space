@@ -537,13 +537,16 @@ struct ZaloConversation: View {
                     .mentionSuggestions(session: session, chat: chat, accent: ZL.blue)
         }
         .fileDropTarget(session: session, chatId: chat.id, accent: ZL.blue)
+        .memberPage(session: session, chat: chat)
     }
 
     private var header: some View {
         HStack(spacing: compact ? 10 : 12) {
             ZaloAvatar(id: chat.id, title: chat.title, source: chat.avatar, size: compact ? 38 : 48, group: chat.isGroup)
+                .chatPage(session: session, chat: chat)
             VStack(alignment: .leading, spacing: 3) {
                 Text(chat.title).font(.zalo(compact ? 15 : 17, .semibold)).foregroundStyle(ZL.text).lineLimit(1)
+                    .chatPage(session: session, chat: chat)
                 subtitle.lineLimit(1)
             }
             Spacer(minLength: 8)

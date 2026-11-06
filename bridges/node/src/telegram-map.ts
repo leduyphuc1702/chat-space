@@ -144,6 +144,20 @@ export function thumbFrom(sizes?: Api.TypePhotoSize[]): string | undefined {
   return undefined;
 }
 
+/**
+ * The size to download for a grid tile: the smallest real photo size (or video/document thumbnail) whose long
+ * side reaches `minSide`, else the largest there is. Stripped and cached sizes are the blurry inline ones.
+ */
+export function previewSize(media: Api.TypeMessageMedia | undefined, minSide = 480): Api.TypePhotoSize | undefined {
+  let sizes: Api.TypePhotoSize[] | undefined;
+  if (media instanceof Api.MessageMediaPhoto && media.photo instanceof Api.Photo) sizes = media.photo.sizes;
+  else if (media instanceof Api.MessageMediaDocument && media.document instanceof Api.Document) sizes = media.document.thumbs;
+  const real = (sizes ?? [])
+    .filter((s): s is Api.PhotoSize | Api.PhotoSizeProgressive => s instanceof Api.PhotoSize || s instanceof Api.PhotoSizeProgressive)
+    .sort((a, b) => Math.max(a.w, a.h) - Math.max(b.w, b.h));
+  return real.find((s) => Math.max(s.w, s.h) >= minSide) ?? real[real.length - 1];
+}
+
 function photoMedia(photo: Api.Photo): Media {
   let best: { w: number; h: number; size?: number } | undefined;
   for (const s of photo.sizes) {

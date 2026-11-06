@@ -389,13 +389,16 @@ struct MessengerConversation: View {
         }
         .background(Color.white)
         .fileDropTarget(session: session, chatId: chat.id, accent: MS.blue)
+        .memberPage(session: session, chat: chat)
     }
 
     private var header: some View {
         HStack(spacing: 10) {
             MessengerAvatar(source: chat.avatar, size: 40, online: chat.online == true)
+                .chatPage(session: session, chat: chat)
             VStack(alignment: .leading, spacing: 1) {
                 Text(chat.title).font(.system(size: 15, weight: .semibold)).foregroundStyle(MS.text).lineLimit(1)
+                    .chatPage(session: session, chat: chat)
                 Text(status).font(.system(size: 13)).foregroundStyle(MS.secondary).lineLimit(1)
             }
             Spacer()

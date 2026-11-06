@@ -13,6 +13,7 @@ import {
   muteInfo,
   muteUntilSeconds,
   normalizeReactionEmoji,
+  previewSize,
   previewText,
   reactionEmoticonForTelegram,
   ReplyResolver,
@@ -830,5 +831,37 @@ describe("TelegramAdapter with a fake client", () => {
     a.inputPeers.set("30", new Api.InputPeerUser({ userId: big(30), accessHash: big(300) }));
     await expect(adapter.directChat("30")).rejects.toMatchObject({ code: "not_found" });
     expect(invoked).toHaveLength(0);
+  });
+});
+
+describe("previewSize", () => {
+  const ps = (type: string, w: number, h: number) => new Api.PhotoSize({ type, w, h, size: w * h });
+  const photoWith = (sizes: Api.TypePhotoSize[]) =>
+    new Api.MessageMediaPhoto({
+      photo: new Api.Photo({ id: big(1), accessHash: big(1), fileReference: Buffer.alloc(0), date: 1, sizes, dcId: 2 }),
+    });
+
+  test("picks the smallest real size that is sharp enough, never the stripped one", () => {
+    const stripped = new Api.PhotoStrippedSize({ type: "i", bytes: Buffer.from([1, 40, 40]) });
+    const s = previewSize(photoWith([stripped, ps("s", 90, 67), ps("m", 320, 240), ps("x", 800, 600), ps("y", 1280, 960)]));
+    expect((s as Api.PhotoSize).type).toBe("x");
+  });
+
+  test("falls back to the largest when none reaches the size", () => {
+    const s = previewSize(photoWith([ps("s", 90, 67), ps("m", 320, 240)]));
+    expect((s as Api.PhotoSize).type).toBe("m");
+  });
+
+  test("videos use the document's thumbnails; nothing to preview gives undefined", () => {
+    const doc = (thumbs?: Api.TypePhotoSize[]) =>
+      new Api.MessageMediaDocument({
+        document: new Api.Document({
+          id: big(2), accessHash: big(2), fileReference: Buffer.alloc(0), date: 1, mimeType: "video/mp4",
+          size: big(10), dcId: 2, attributes: [], thumbs,
+        }),
+      });
+    expect((previewSize(doc([ps("m", 320, 180)])) as Api.PhotoSize).type).toBe("m");
+    expect(previewSize(doc())).toBeUndefined();
+    expect(previewSize(undefined)).toBeUndefined();
   });
 });

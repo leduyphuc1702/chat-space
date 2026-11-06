@@ -380,13 +380,16 @@ struct WhatsAppConversation: View {
                     .mentionSuggestions(session: session, chat: chat, accent: WA.teal)
         }
         .fileDropTarget(session: session, chatId: chat.id, accent: WA.teal)
+        .memberPage(session: session, chat: chat)
     }
 
     private var header: some View {
         HStack(spacing: 14) {
             WhatsAppAvatar(source: chat.avatar, group: chat.isGroup, size: 40)
+                .chatPage(session: session, chat: chat)
             VStack(alignment: .leading, spacing: 1) {
                 Text(chat.title).font(.system(size: 16)).foregroundStyle(WA.text).lineLimit(1)
+                    .chatPage(session: session, chat: chat)
                 subtitle.font(.system(size: 13)).lineLimit(1)
             }
             Spacer()
